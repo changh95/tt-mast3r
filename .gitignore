@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+run.log
+eval.log
+eval_full.log
+eval_bf16.log
+co3d_data/
+.omc/
+.DS_Store

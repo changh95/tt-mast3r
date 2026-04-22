@@ -1,0 +1,36 @@
+commit	gen_speed	accuracy	status	description
+ad1e4a6	2.3172	99.7440	keep	baseline: dpt-channels-last (e2e ~432ms, head1=0.9949 head2=0.9971)
+ad1e4a6	2.2746	99.7440	discard	batch encoder B=2 (slightly slower 432→440ms)
+ad1e4a6	2.1696	99.7440	discard	parallel encoder threads (461ms — ttnn ops likely serialized)
+02e0683816	2.3645	99.7440	keep	cache pos.max().item() to skip 96 host syncs/inference (432→423ms)
+02e0683	1.9732	99.7437	discard	torch.compile DPT (any mode) — much slower 423→507ms
+02e0683	2.1198	99.7440	discard	sequential DPT (slower 423→472ms — parallel exploits cores)
+02e0683	2.3128	99.7440	discard	cap torch threads to 4 for DPT (slightly worse 423→432ms)
+bdcf9fc5fe	2.4589	99.7440	keep	encoder split_qkv fused op (-5 ttnn ops/block, 423→407ms)
+cc7c751bc7	2.5141	99.7440	keep	decoder self-attn split_qkv (407→398ms)
+07a8539d30	2.5685	99.7440	keep	decoder cross-attn fused K+V linear + split_qkv (398→389ms)
+07a8539	2.5382	99.7440	discard	rope LUT cache (~387ms = roughly break-even)
+093025bcec	2.5963	99.7440	keep	in-place relus in DPT (saves allocations, 389→385ms)
+093025b	2.5510	99.7440	discard	encoder qk concat-then-slice (~393ms — extra ops cost more than saved sync)
+093025b	2.5640	99.8300	discard	LoFi for all encoder linears (no speedup, head1 PCC 0.995→0.978)
+093025b	2.5290	99.7440	discard	combine qk into one upload (~395ms — slice ops cost more than saved sync)
+093025b	3.1648	94.0000	discard	no-RoPE measurement: 316ms (broken PCC) — confirms ~70ms cost from RoPE roundtrips
+093025b	2.5800	99.7600	discard	on-device 2D RoPE for enc+dec (~387ms = break-even, adds complexity)
+c23829ebe8	2.6042	99.7440	keep	defer decoder tap downloads (cleaner, slight improvement)
+fab9b04484	2.6390	99.7440	keep	cache enc_norm weights (~381ms)
+21c4c7a44e	2.6178	99.7440	keep	encoder→decoder no-roundtrip (~383ms median)
+5ddbd30096	2.6316	99.7440	keep	cache patch_embed weights (~380ms median)
+5ddbd30	2.6385	99.7440	discard	packer_l1_acc on encoder linears (no measurable improvement)
+5ddbd30	2.6525	99.7440	keep	FINAL: stable ~377ms median (best-of-20 runs) — 432→377ms total (12.7% gain)
+5ddbd30	2.6420	99.7440	discard	batched q+k host RoPE in encoder (no improvement)
+d5349558d4	2.6353	99.7440	keep	skip dec_norm in e2e path (correctness fix, latency same)
+9041a8c945	2.6954	99.7440	keep	rope LUT cache (cos[pos] precomputed once, 378→371ms)
+46700fdf8f	2.7158	99.7440	keep	rope combined LUT, single multiply (371→368ms)
+f86da13b4e	2.7212	99.7440	keep	decoder self-attn use concat_heads (~367ms)
+f86da13	2.7624	99.7440	keep	FINAL: ~362ms median (best-of-25 runs) — 432→362ms total (16.2% gain, 2.32→2.76 fps)
+138f1510c3	2.7768	99.7800	keep	patch_embed matmul+add → linear with bias (cleaner)
+ad13ae2513	2.6832	99.7500	keep	on-device 2D RoPE for enc+dec (no host roundtrip, 360→372ms)
+b31cf3b992	2.6824	99.7500	keep	patch_embed device-resident output (no roundtrip, ~372ms)
+6cd58acf79	4.3360	99.6100	keep	DPT FULLY ON DEVICE — 360→230ms (35% gain), combined PCC 0.9961
+6cd58acf	4.3478	99.6100	keep	FINAL: ~230ms (47% gain from 432ms baseline) — DPT+RoPE+patch_embed all on device
+5b3587f185	4.3478	99.6100	keep	FINAL: ~230ms — encoder, decoder, RoPE, patch_embed (incl. im2col), DPT all on device
