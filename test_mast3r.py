@@ -12,6 +12,14 @@ Usage:
     python3 test_mast3r.py                      # end_to_end (default)
     python3 test_mast3r.py --layer end_to_end --runs 3
     python3 test_mast3r.py --layer full_encoder
+    python3 test_mast3r.py --layer dpt_head_device   # the on-device DPT head (dpt_head = torch bf16 host reference)
+
+The fused path is the default since the 2026-09-13 device validation (TT_FUSED unset or 1;
+read once by the port, see models/demos/mast3r/tt/fused.py): full_encoder / full_decoder /
+dpt_head_device run the fused ops eagerly; end_to_end runs the traced TtDust3r graph unless
+MAST3R_TRACE=0. TT_FUSED=0 selects the legacy eager graph. The device is opened with the
+trace region the configuration needs (FusedConfig.open_device_kwargs) and the port's device
+caches are released before close_device.
 """
 from __future__ import annotations
 
@@ -21,22 +29,16 @@ import sys
 import time
 import traceback
 
-# Use medgemma's tt-metal build — the venv ttnn points at a scrubbed
-# pi0_5 checkout whose kernel sources are missing. medgemma has both
-# the compiled libs and a matching kernel source tree.
-_TT_METAL_ROOT = "/home/ttuser/experiments/medgemma/tt-metal"
-if _TT_METAL_ROOT not in sys.path:
-    sys.path.insert(0, _TT_METAL_ROOT)
-    sys.path.insert(1, os.path.join(_TT_METAL_ROOT, "ttnn"))
-    sys.path.insert(2, os.path.join(_TT_METAL_ROOT, "tools"))
-os.chdir(_TT_METAL_ROOT)
+# ttnn must be importable from the active environment (a tt-metal python_env, or
+# PYTHONPATH=<tt-metal>:<tt-metal>/ttnn). The port is imported with its package
+# spelling (models.demos.mast3r.*) from this repo's code/ dir.
+_CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
 
 import torch  # noqa: E402
 
-_MAST3R_ROOT = "/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r"
-sys.path.insert(0, _MAST3R_ROOT)
-
-from reference.torch_dust3r import (  # noqa: E402
+from models.demos.mast3r.reference.torch_dust3r import (  # noqa: E402
     load_checkpoint,
     load_patch_embed,
     load_encoder_block,
@@ -104,7 +106,7 @@ def print_result(layer: str, pcc_val: float, latency_ms: float,
 # ---------- per-layer runners ----------
 
 def run_patch_embed(device, runs: int):
-    from tt.ttnn_dust3r import patch_embed as tt_patch_embed
+    from models.demos.mast3r.tt.ttnn_dust3r import patch_embed as tt_patch_embed
 
     torch.manual_seed(0)
     state = load_checkpoint()
@@ -126,7 +128,7 @@ def run_patch_embed(device, runs: int):
 
 
 def run_encoder_block(device, idx: int, runs: int):
-    from tt.ttnn_dust3r import encoder_block as tt_encoder_block
+    from models.demos.mast3r.tt.ttnn_dust3r import encoder_block as tt_encoder_block
 
     torch.manual_seed(0)
     state = load_checkpoint()
@@ -156,7 +158,7 @@ def run_encoder_block(device, idx: int, runs: int):
 
 
 def run_decoder_block(device, idx: int, branch: int, runs: int):
-    from tt.ttnn_dust3r import decoder_block as tt_decoder_block
+    from models.demos.mast3r.tt.ttnn_dust3r import decoder_block as tt_decoder_block
 
     torch.manual_seed(0)
     state = load_checkpoint()
@@ -193,7 +195,7 @@ def run_decoder_block(device, idx: int, branch: int, runs: int):
 
 
 def run_dpt_head(device, branch: int, runs: int):
-    from tt.ttnn_dust3r import dpt_head as tt_dpt_head
+    from models.demos.mast3r.tt.ttnn_dust3r import dpt_head as tt_dpt_head
 
     torch.manual_seed(0)
     state = load_checkpoint()
@@ -216,8 +218,47 @@ def run_dpt_head(device, branch: int, runs: int):
     return ref_out, tt_out, min(times)
 
 
+def run_dpt_head_device(device, branch: int, runs: int):
+    """The on-device DPT head (``dpt_head_device``, the function ``dust3r_forward`` /
+    ``TtDust3r`` call) on the same synthetic taps as ``run_dpt_head``. The four taps are
+    uploaded once as ``(B, N, D)`` bf16 TILE tensors; with ``TT_FUSED=1`` this A/Bs the
+    TILE tap reshape, the fused conv relu and the cached prepared conv weights eagerly
+    (``MAST3R_DPT_FUSE=0`` isolates the first two from the weight cache)."""
+    import ttnn
+    from models.demos.mast3r.tt.ttnn_dust3r import dpt_head_device as tt_dpt_head_device
+
+    torch.manual_seed(0)
+    state = load_checkpoint()
+    ref = load_dpt_head(state, branch=branch)
+    B, N = 1, 32 * 32
+    f0 = torch.randn(B, N, 1024) * 0.02
+    f1 = torch.randn(B, N, 768) * 0.02
+    f2 = torch.randn(B, N, 768) * 0.02
+    f3 = torch.randn(B, N, 768) * 0.02
+    feats = [f0, f1, f2, f3]
+    hw = (32, 32)
+    Hh, Wh = hw[0] * 16, hw[1] * 16
+    with torch.no_grad():
+        ref_out = ref(feats, hw)
+    tt_feats = [ttnn.from_torch(f, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device) for f in feats]
+
+    def forward():
+        out = tt_dpt_head_device(tt_feats, hw, state, branch, device)   # NHWC flat (1, 1, B*Hh*Wh, 4)
+        return ttnn.to_torch(out).reshape(B, Hh, Wh, 4).permute(0, 3, 1, 2).contiguous().float()
+
+    _ = forward()
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        tt_out = forward()
+        times.append((time.perf_counter() - t0) * 1000)
+    for t in tt_feats:
+        ttnn.deallocate(t)
+    return ref_out, tt_out, min(times)
+
+
 def run_full_encoder(device, runs: int):
-    from tt.ttnn_dust3r import full_encoder as tt_full_encoder
+    from models.demos.mast3r.tt.ttnn_dust3r import full_encoder as tt_full_encoder
 
     torch.manual_seed(0)
     state = load_checkpoint()
@@ -235,7 +276,7 @@ def run_full_encoder(device, runs: int):
 
 
 def run_full_decoder(device, runs: int):
-    from tt.ttnn_dust3r import full_decoder as tt_full_decoder
+    from models.demos.mast3r.tt.ttnn_dust3r import full_decoder as tt_full_decoder
 
     torch.manual_seed(0)
     state = load_checkpoint()
@@ -259,7 +300,7 @@ def run_full_decoder(device, runs: int):
 
 
 def run_end_to_end(device, runs: int):
-    from tt.ttnn_dust3r import dust3r_forward
+    from models.demos.mast3r.tt.ttnn_dust3r import dust3r_forward
 
     torch.manual_seed(0)
     state = load_checkpoint()
@@ -287,6 +328,8 @@ LAYER_DISPATCH = {
     "full_decoder": lambda d, r: run_full_decoder(d, r),
     "dpt_head": lambda d, r: run_dpt_head(d, 1, r),
     "dpt_head_2": lambda d, r: run_dpt_head(d, 2, r),
+    "dpt_head_device": lambda d, r: run_dpt_head_device(d, 1, r),
+    "dpt_head_device_2": lambda d, r: run_dpt_head_device(d, 2, r),
     "end_to_end": lambda d, r: run_end_to_end(d, r),
     **{f"encoder_block_{i}": (lambda d, r, i=i: run_encoder_block(d, i, r)) for i in range(24)},
     **{f"decoder_block_{i}": (lambda d, r, i=i: run_decoder_block(d, i, 1, r)) for i in range(12)},
@@ -304,9 +347,16 @@ def main():
     args = parser.parse_args()
 
     import ttnn
+    from models.demos.mast3r.tt.ttnn_dust3r import fused_config, release_device_caches
 
+    # The port reads TT_FUSED (+ sub-knobs) once, here. With the traced fused path the
+    # device needs an explicit trace region (otherwise this tree's default of 0 selects the
+    # dynamic trace-allocation mode, which no gate of this port runs in).
+    fused = fused_config()
+    print(f"# port path: {'fused ' + str(fused.summary()) if fused.enabled else 'legacy (TT_FUSED=0)'}")
     # l1_small_size needed by ttnn.conv2d (sliding window state buffer).
-    device = ttnn.open_device(device_id=args.device_id, l1_small_size=32 * 1024)
+    device = ttnn.open_device(device_id=args.device_id,
+                              **fused.open_device_kwargs(l1_small_size=32 * 1024))
     if hasattr(device, "enable_program_cache"):
         device.enable_program_cache()
     try:
@@ -326,6 +376,13 @@ def main():
             print_result(args.layer, 0.0, 0.0, "crash")
             return 3
     finally:
+        # Drop the port's device-resident caches (weights, LUTs, and with TT_FUSED=1 the
+        # metal trace + persistent input / output buffers) BEFORE closing the device;
+        # otherwise ttnn frees them against a closed device at interpreter exit.
+        try:
+            release_device_caches()
+        except Exception:
+            traceback.print_exc()
         ttnn.close_device(device)
 
 

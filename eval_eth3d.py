@@ -16,21 +16,18 @@ import os
 import sys
 from pathlib import Path
 
-_TT_METAL_ROOT = "/home/ttuser/experiments/medgemma/tt-metal"
-sys.path.insert(0, _TT_METAL_ROOT)
-sys.path.insert(1, os.path.join(_TT_METAL_ROOT, "ttnn"))
-os.chdir(_TT_METAL_ROOT)
-
-_REPO = "/home/ttuser/experiments/tt-mast3r"
-sys.path.insert(0, _REPO)
-sys.path.insert(0, f"{_REPO}/models/demos/mast3r")
+# The port is imported with its package spelling from this repo's code/ dir; ttnn
+# comes from the active environment.
+_CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
 
 import numpy as np
 import torch
 import ttnn
 
-from reference.torch_dust3r import load_checkpoint, load_dust3r
-from tt.ttnn_dust3r import dust3r_forward
+from models.demos.mast3r.reference.torch_dust3r import load_checkpoint, load_dust3r
+from models.demos.mast3r.tt.ttnn_dust3r import dust3r_forward
 from eval_mast3r import (
     load_image_for_dust3r, activate_pts3d, activate_conf, pcc,
     pair_viewer_pose, extrinsic_to_rel, rel_rotation_angle_deg,

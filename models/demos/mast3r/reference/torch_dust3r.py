@@ -12,7 +12,9 @@ Architecture (from config.json):
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -20,15 +22,69 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 
-CKPT_DIR = Path(
-    "/home/ttuser/.cache/huggingface/hub/"
-    "models--naver--DUSt3R_ViTLarge_BaseDecoder_512_dpt/snapshots"
-)
+# ---------- checkpoint resolution ----------
+#
+# The weights are a POINTER (never shipped with the code). tt-model pre-downloads the
+# pinned snapshot into the HF cache and exports HF_MODEL=<repo id>; the pinned sha does
+# NOT reach the container by itself, which is why the manifest's serve.env carries
+# TT_WEIGHTS_REVISION. A sha-pinned snapshot has no refs/main, so resolving with
+# revision=None would go to the network -- always pass the revision when you have one.
+
+DEFAULT_WEIGHTS_REPO = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
+WEIGHTS_FILENAME = "model.safetensors"
+
+# Environment knobs (read when called, never at import):
+#   HF_MODEL             weights repo id (set by `tt-model serve`; default above)
+#   TT_WEIGHTS_REVISION  commit sha / tag of that repo (manifest serve.env)
+#   MAST3R_WEIGHTS_DIR   a local directory holding model.safetensors (offline / host use;
+#                        wins over the Hub lookup when set)
 
 
-def load_checkpoint():
-    snap = next(CKPT_DIR.iterdir())
-    return load_file(str(snap / "model.safetensors"))
+def resolve_checkpoint_path(repo_id: Optional[str] = None,
+                            revision: Optional[str] = None,
+                            weights_dir: Optional[str] = None,
+                            filename: str = WEIGHTS_FILENAME) -> Path:
+    """Return the local path of ``model.safetensors``.
+
+    Order: explicit ``weights_dir`` / ``$MAST3R_WEIGHTS_DIR`` -> ``hf_hub_download``
+    from ``repo_id`` / ``$HF_MODEL`` at ``revision`` / ``$TT_WEIGHTS_REVISION`` (a
+    cache hit when tt-model pre-downloaded it; a download otherwise) -> the same lookup
+    with ``local_files_only=True`` when the Hub is unreachable.
+    """
+    weights_dir = weights_dir or os.environ.get("MAST3R_WEIGHTS_DIR")
+    if weights_dir:
+        path = Path(weights_dir).expanduser() / filename
+        if not path.is_file():
+            raise FileNotFoundError(f"MAST3R_WEIGHTS_DIR={weights_dir!r} has no {filename}")
+        return path
+
+    from huggingface_hub import hf_hub_download
+
+    repo_id = repo_id or os.environ.get("HF_MODEL") or DEFAULT_WEIGHTS_REPO
+    revision = revision or os.environ.get("TT_WEIGHTS_REVISION") or None
+    try:
+        return Path(hf_hub_download(repo_id=repo_id, filename=filename, revision=revision))
+    except Exception as first:  # offline / no refs/main for a sha-pinned snapshot
+        try:
+            return Path(hf_hub_download(repo_id=repo_id, filename=filename,
+                                        revision=revision, local_files_only=True))
+        except Exception:
+            raise RuntimeError(
+                f"could not resolve {repo_id}/{filename} (revision={revision!r}) from the "
+                f"Hub or the local HF cache; set TT_WEIGHTS_REVISION / MAST3R_WEIGHTS_DIR "
+                f"or pre-download the weights"
+            ) from first
+
+
+def load_checkpoint(path: Optional[os.PathLike] = None, **resolve_kwargs) -> dict:
+    """Flat fp32 state dict of the DUSt3R checkpoint (~2.3 GB host RAM).
+
+    ``path`` skips resolution; otherwise see :func:`resolve_checkpoint_path`.
+    Callers must keep ONE state dict alive for the process lifetime -- the ttnn port
+    memoises device weights on ``id(state)``.
+    """
+    ckpt = Path(path) if path is not None else resolve_checkpoint_path(**resolve_kwargs)
+    return load_file(str(ckpt))
 
 
 # ---------- RoPE (100 base, 2D) ----------

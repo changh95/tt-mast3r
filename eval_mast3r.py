@@ -21,7 +21,7 @@ Two families of metrics per (scene, view-pair):
          (same metric family as tt-vggt's eval_vggt.py).
 
 Usage:
-    python3 eval_mast3r.py --co3d-root /home/ttuser/experiments/vggt/co3d_data \\
+    python3 eval_mast3r.py --co3d-root co3d_data \\
         --category apple --pairs 6 --device-id 0
 """
 from __future__ import annotations
@@ -33,23 +33,22 @@ import os
 import sys
 from pathlib import Path
 
-# Match test_mast3r.py's import shim.
-_TT_METAL_ROOT = "/home/ttuser/experiments/medgemma/tt-metal"
-if _TT_METAL_ROOT not in sys.path:
-    sys.path.insert(0, _TT_METAL_ROOT)
-    sys.path.insert(1, os.path.join(_TT_METAL_ROOT, "ttnn"))
-    sys.path.insert(2, os.path.join(_TT_METAL_ROOT, "tools"))
-os.chdir(_TT_METAL_ROOT)
+# Match test_mast3r.py's import shim: the port is imported with its package spelling
+# from this repo's code/ dir; ttnn comes from the active environment.
+_CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-import cv2  # noqa: E402
-from PIL import Image  # noqa: E402
 
-_MAST3R_ROOT = "/home/ttuser/experiments/mast3r/tt-metal/models/demos/mast3r"
-sys.path.insert(0, _MAST3R_ROOT)
-
-from reference.torch_dust3r import load_checkpoint, load_dust3r  # noqa: E402
+from models.demos.mast3r.reference.torch_dust3r import load_checkpoint, load_dust3r  # noqa: E402
+# Pre/post-processing + PairViewer pose live in the package now (the serving app
+# imports them from there); re-exported so eval_eth3d.py / make_demo.py keep working.
+from models.demos.mast3r.postprocess import (  # noqa: E402,F401
+    load_image_for_dust3r, activate_pts3d, activate_conf,
+    estimate_focal, pnp_pose, pair_viewer_pose,
+)
 
 
 # ---------- CO3D annotations ----------
@@ -69,27 +68,7 @@ def load_co3d_annotations(co3d_root: Path, category: str):
 
 
 # ---------- image preprocessing for DUSt3R (512×512) ----------
-
-def load_image_for_dust3r(path: Path, size: int = 512):
-    """Pad to square (gray 128) then resize to `size × size`, normalise to
-    [-1, 1]. Preserves image content; PCC port-vs-ref stays > 0.99 xyz on
-    real CO3D apple pairs. Returns the tensor plus a preprocess record
-    that lets callers project CO3D's NDC intrinsics into the 512-pixel
-    grid.
-    """
-    img = Image.open(path).convert("RGB")
-    W, H = img.size
-    s = max(W, H)
-    canvas = Image.new("RGB", (s, s), (128, 128, 128))
-    offx, offy = (s - W) // 2, (s - H) // 2
-    canvas.paste(img, (offx, offy))
-    canvas = canvas.resize((size, size), Image.BICUBIC)
-    arr = np.asarray(canvas, dtype=np.float32) / 255.0
-    arr = (arr - 0.5) / 0.5
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
-    return tensor, {"orig_W": W, "orig_H": H, "offx": offx, "offy": offy,
-                    "pad_side": s, "out_size": size}
-
+# load_image_for_dust3r -> models.demos.mast3r.postprocess
 
 def co3d_gt_K(viewpoint: dict, preproc: dict) -> np.ndarray:
     """Build (3, 3) K in the `size × size` preprocessed-image pixel grid from
@@ -110,23 +89,7 @@ def co3d_gt_K(viewpoint: dict, preproc: dict) -> np.ndarray:
 
 
 # ---------- DUSt3R output postprocess ----------
-
-def activate_pts3d(raw: torch.Tensor) -> torch.Tensor:
-    """Apply DUSt3R's depth_mode='exp' activation to the 3 xyz channels.
-
-    raw: (B, 4, H, W) — channels 0..2 are xyz (pre-activation), 3 is conf.
-    Returns (B, H, W, 3) float pointmap in the camera-1 frame (for head 1)
-    or in camera-1 frame (for head 2 — DUSt3R's convention: both heads
-    produce points in camera-1's coordinate system).
-    """
-    xyz = raw[:, :3].permute(0, 2, 3, 1).contiguous()   # (B, H, W, 3)
-    d = xyz.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    return xyz * (torch.expm1(d) / d)
-
-
-def activate_conf(raw: torch.Tensor) -> torch.Tensor:
-    """conf_mode = ('exp', 1, +inf) → 1 + exp(c)."""
-    return 1.0 + raw[:, 3].exp()
+# activate_pts3d / activate_conf -> models.demos.mast3r.postprocess
 
 
 # ---------- metrics ----------
@@ -150,86 +113,7 @@ def depth_rel_error(pred_z: np.ndarray, ref_z: np.ndarray, mask: np.ndarray):
 
 
 # ---------- pose recovery (DUSt3R PairViewer, 2-view global aligner) ----------
-
-def estimate_focal(pts3d: np.ndarray, pp: np.ndarray) -> float:
-    """Median-vote focal estimator matching DUSt3R's `estimate_focal_knowing_depth`
-    (focal_mode='median'). `pts3d` is an (H, W, 3) pointmap in the camera's own
-    frame; `pp` is the (2,) principal point in pixel coords (typically image
-    centre). Pixel (u, v) with 3D (X, Y, Z) gives f = |(u - cx) * Z / X| and
-    similarly in y — we take the median over all pixels and assume fx == fy.
-    """
-    H, W, _ = pts3d.shape
-    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-    pixels = np.stack([xs, ys], axis=-1).astype(np.float64) - pp[None, None]  # (H, W, 2)
-    z = pts3d[..., 2]
-    xy = pts3d[..., :2]
-    # f = pixels * z / xy, with |xy| floor to avoid exploding at the optical axis.
-    denom = np.where(np.abs(xy) < 1e-6, np.sign(xy) * 1e-6 + 1e-12, xy)
-    f_votes = pixels * z[..., None] / denom  # (H, W, 2)
-    f_votes = f_votes[np.isfinite(f_votes)]
-    f = float(np.median(np.abs(f_votes)))
-    # Clamp to a sane focal range (same convention as DUSt3R: 0.5× — 4× image size).
-    focal_base = max(H, W) / (2 * np.tan(np.deg2rad(60) / 2))   # ~0.866 × max side
-    return float(np.clip(f, 0.2 * focal_base, 8.0 * focal_base))
-
-
-def pnp_pose(pts3d: np.ndarray, K: np.ndarray, conf: np.ndarray,
-             conf_pct: float = 50.0, reproj_err: float = 5.0):
-    """PnP-RANSAC on (pts3d, pixel grid, K). Returns (3, 4) extrinsic or None."""
-    H, W, _ = pts3d.shape
-    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-    pts2d = np.stack([xs, ys], axis=-1).astype(np.float64).reshape(-1, 2)
-    pts3d_flat = pts3d.reshape(-1, 3).astype(np.float64)
-    c = conf.reshape(-1)
-
-    keep = c >= np.percentile(c, 100.0 - conf_pct)
-    keep &= np.isfinite(pts3d_flat).all(-1)
-    if keep.sum() < 50:
-        return None
-    ok, rvec, tvec, _ = cv2.solvePnPRansac(
-        pts3d_flat[keep].reshape(-1, 1, 3),
-        pts2d[keep].reshape(-1, 1, 2),
-        K, distCoeffs=None,
-        iterationsCount=500, reprojectionError=reproj_err,
-        confidence=0.9999, flags=cv2.SOLVEPNP_ITERATIVE,
-    )
-    if not ok:
-        return None
-    R, _ = cv2.Rodrigues(rvec)
-    return np.concatenate([R, tvec.reshape(3, 1)], axis=-1)
-
-
-def pair_viewer_pose(raw_ii, raw_ji, raw_jj, raw_ij, img_size: int,
-                      K_j_override=None):
-    """DUSt3R PairViewer: given the 4 pointmaps produced by symmetric forwards
-    on (i, j) and (j, i), recover view-j's relative pose in view-i's frame.
-
-    raw_ii = head-1 output of forward(i, j) — pts3d of view i in view i's frame
-    raw_ji = head-2 output of forward(i, j) — pts3d of view j in view i's frame
-    raw_jj = head-1 output of forward(j, i) — pts3d of view j in view j's frame
-    raw_ij = head-2 output of forward(j, i) — pts3d of view i in view j's frame
-
-    When `K_j_override` is given, skip the DUSt3R focal-estimation head and
-    use those calibrated intrinsics (e.g. CO3D GT) for PnP — isolates the
-    PairViewer pose bill from the focal-estimation bill.
-    """
-    pts_ii = activate_pts3d(raw_ii)[0].cpu().numpy()
-    pts_ji = activate_pts3d(raw_ji)[0].cpu().numpy()
-    pts_jj = activate_pts3d(raw_jj)[0].cpu().numpy()
-    conf_ji = activate_conf(raw_ji)[0].cpu().numpy()
-
-    pp = np.array([img_size / 2.0, img_size / 2.0], dtype=np.float64)
-    f_i = estimate_focal(pts_ii, pp)
-    f_j = estimate_focal(pts_jj, pp)
-
-    if K_j_override is not None:
-        K_j = K_j_override
-    else:
-        K_j = np.array([[f_j, 0, pp[0]], [0, f_j, pp[1]], [0, 0, 1]], dtype=np.float64)
-    extri_j = pnp_pose(pts_ji, K_j, conf_ji)
-    if extri_j is None:
-        return None
-    return extri_j[:, :3], extri_j[:, 3], f_i, f_j
+# estimate_focal / pnp_pose / pair_viewer_pose -> models.demos.mast3r.postprocess
 
 
 # ---------- CO3D GT pose / relative-pose metrics ----------
@@ -389,7 +273,7 @@ def eval_pair(i: int, j: int, anns_i: dict, anns_j: dict, co3d_root: Path,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--co3d-root", type=Path,
-                    default=Path("/home/ttuser/experiments/vggt/co3d_data"))
+                    default=Path("co3d_data"))
     ap.add_argument("--category", default="apple")
     ap.add_argument("--seqs", default="",
                     help="Comma-separated seq names (empty = all).")
@@ -407,8 +291,14 @@ def main():
     print(f"# sequences: {seqs}")
 
     import ttnn
-    from tt.ttnn_dust3r import dust3r_forward
-    device = ttnn.open_device(device_id=args.device_id, l1_small_size=32 * 1024)
+    from models.demos.mast3r.tt.ttnn_dust3r import dust3r_forward, fused_config, release_device_caches
+    # TT_FUSED (+ sub-knobs) is read once, here. The traced fused path needs an explicit
+    # trace region (this tree's default of 0 = dynamic trace-allocation mode, which no gate
+    # of this port runs in); legacy / MAST3R_TRACE=0 keep the plain open.
+    fused = fused_config()
+    print(f"# port path: {'fused ' + str(fused.summary()) if fused.enabled else 'legacy (TT_FUSED=0)'}")
+    device = ttnn.open_device(device_id=args.device_id,
+                              **fused.open_device_kwargs(l1_small_size=32 * 1024))
     if hasattr(device, "enable_program_cache"):
         device.enable_program_cache()
     try:
@@ -443,6 +333,13 @@ def main():
 
         _print_summary(per_pair)
     finally:
+        # Release the port's device caches (weights, LUTs; with TT_FUSED=1 also the metal
+        # trace and the persistent buffers) before close_device -- avoids the teardown
+        # crash of freeing them against a closed device.
+        try:
+            release_device_caches()
+        except Exception as e:  # pragma: no cover - best effort at shutdown
+            print(f"# release_device_caches failed: {e!r}")
         ttnn.close_device(device)
 
 

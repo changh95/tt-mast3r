@@ -10,16 +10,16 @@ import os
 import sys
 from pathlib import Path
 
-_TT_METAL_ROOT = "/home/ttuser/experiments/medgemma/tt-metal"
-sys.path.insert(0, _TT_METAL_ROOT)
-sys.path.insert(1, os.path.join(_TT_METAL_ROOT, "ttnn"))
-sys.path.insert(2, os.path.join(_TT_METAL_ROOT, "tools"))
-os.chdir(_TT_METAL_ROOT)
-
-_MAST3R_ROOT = "/home/ttuser/experiments/tt-mast3r/models/demos/mast3r"
-sys.path.insert(0, _MAST3R_ROOT)
-_REPO_ROOT = "/home/ttuser/experiments/tt-mast3r"
-sys.path.insert(0, _REPO_ROOT)
+# The port is imported with its package spelling from this repo's code/ dir; ttnn
+# comes from the active environment. media/ sits beside this file (GitHub layout) or
+# one level up (HF repo layout: code/make_demo.py + media/); MAST3R_REPO_ROOT overrides.
+_CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _CODE_ROOT not in sys.path:
+    sys.path.insert(0, _CODE_ROOT)
+_REPO_ROOT = os.environ.get("MAST3R_REPO_ROOT") or (
+    _CODE_ROOT if os.path.isdir(os.path.join(_CODE_ROOT, "media"))
+    else os.path.dirname(_CODE_ROOT)
+)
 
 import numpy as np
 import torch
@@ -29,8 +29,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from reference.torch_dust3r import load_checkpoint
-from tt.ttnn_dust3r import dust3r_forward, _make_positions_cached
+from models.demos.mast3r.reference.torch_dust3r import load_checkpoint
+from models.demos.mast3r.tt.ttnn_dust3r import dust3r_forward, _make_positions_cached
 from eval_mast3r import (
     load_image_for_dust3r, activate_pts3d, activate_conf,
     pair_viewer_pose, co3d_gt_K, co3d_to_opencv_extrinsic,
@@ -87,7 +87,7 @@ def render_pointcloud(pts_list, rgb_list, conf_list, out_path: Path,
 
 
 def main():
-    co3d_root = Path("/home/ttuser/experiments/vggt/co3d_data")
+    co3d_root = Path(os.environ.get("CO3D_ROOT", "co3d_data"))
     category = "apple"
     seq = "540_79043_153212"
     i, j = 0, 40   # GT rot ≈ 64°, mid-range baseline — representative of the
