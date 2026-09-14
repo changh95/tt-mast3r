@@ -9,88 +9,124 @@ head — with pose recovered via the paper's `PairViewer` global aligner.
 
 |                                | torch CPU reference | **ttnn port on p150a** | ratio |
 |--------------------------------|--------------------:|-----------------------:|-------|
-| latency / pair (B=1, 512×512), fused default (`test_mast3r.py` best-of-25, 2026-09-13) | ~5000 ms (fp32) | **73.0 ms** (legacy graph `TT_FUSED=0`: 234.2 ms) | **68×** |
-| served device forward, 30 warm requests, median / min / max | — | **73.6 / 73.2 / 79.9 ms** (legacy: 236.9 / 234.5 / 246.6) | — |
-| throughput (device forward)    | 0.20 fps            | **13.7 fps** (legacy: 4.27) | **68×** |
-| PCC port vs ref, synthetic e2e (`test_mast3r.py`) | — | 0.9970 (legacy graph: 0.9968) | — |
-| xyz PCC port vs ref, 7 real pairs, mean / min (2026-09-13) | — | **head1 0.9903 / 0.9718 · head2 0.9949 / 0.9863** (legacy graph: 0.9879 / 0.9722 · 0.9943 / 0.9856) | — |
-| min-PCC port vs ref, CO3Dv2 apple xyz (legacy graph; not re-run on the fused path) | — | **0.9777 (head1), 0.9901 (head2)** | — |
-| AUC@30° (CO3Dv2 apple, 12 pairs, est-focal; legacy graph) | 35.0  | **38.1** | Δ **+3.1** |
-| AUC@30° (CO3Dv2 apple, 12 pairs, known-focal; legacy graph) | 35.4 | **40.4** | Δ **+5.0** |
+| latency / pair (B=1, 512×512), fused default (`test_mast3r.py` best-of-25, fixed taps, 2026-09-14) | ~5000 ms (fp32) | **73.1 ms** (legacy graph `TT_FUSED=0`: 239.0 ms) | **68×** |
+| served `timing_ms.forward`, 30 warm requests, median / min / max (2026-09-13, pre-fix graph; the fix adds 2 `layer_norm`, +0.2 ms in the harness) | — | **73.6 / 73.2 / 79.9 ms** (legacy: 236.9 / 234.5 / 246.6) | — |
+| throughput (device forward)    | 0.20 fps            | **13.7 fps** (legacy: 4.2) | **68×** |
+| PCC port vs ref, synthetic e2e (`test_mast3r.py`, fixed taps) | — | **0.9987** (head1 0.9983 / head2 0.9985; legacy graph: 0.9989) | — |
+| pts3d PCC port vs torch fp32 ref, 4 real pairs (apple / kitchen 00-03 / kitchen 00-08 / fern), fused, 2026-09-14 | — | head1 **0.9995 / 0.9901 / 0.9875 / 0.9978** · head2 **0.9996 / 0.9907 / 0.9920 / 0.9968** | — |
+| two-cloud coherence (median NN distance view-1 ↔ view-2 / scene scale), same 4 pairs | 0.008 / 0.003 / 0.0035 / 0.022 | 0.012 / 0.004 / 0.004 / 0.021 (before the tap fix: 0.39-0.65) | — |
+| PairViewer rotation vs the torch reference, same 4 pairs | — | **0.27 / 0.23 / 0.07 / 0.22 deg** | — |
+| PairViewer rotation on the CO3Dv2 apple pair (GT magnitude 63.71°) | 63.86° | **63.97°** (old network: 58.65°) | — |
 
 The fused device path (single-kernel 2-D RoPE, device-cached conv weights, exact DPT
 cleanups, `dit_minimal_matmul_addcmul_fused` residual linears, SDPA 128/256 chunks, the
 whole graph in one metal trace) is the default since the p150a validation of 2026-09-13
 (`DEVICE_VALIDATION.md`, "Results (device, 2026-09-13)"); `TT_FUSED=0` restores the legacy
-eager graph bit for bit. The CO3Dv2 rows above were measured on the legacy graph and have
-not been re-run on the fused path (the data set was not on the validation box); on the 7
-real pairs that were available the fused path's xyz PCC is at or above the legacy graph's.
-See [Fused device path](#fused-device-path) for the knobs and the host tests.
+eager graph bit for bit. See [Fused device path](#fused-device-path) for the knobs and the
+host tests.
 
-The ttnn port on real CO3Dv2 apple images **beats** the torch reference
-on PairViewer pose accuracy after the `bf8→bf16` weight upgrade (the
-matmul on these shapes is compute-bound, not bandwidth-bound, so the 2×
-DRAM weight cost is free).
+**2026-09-14 — the DPT taps were wrong (port *and* reference).** The DPT head was fed the
+decoder outputs of blocks 0 / 6 / 11 un-normed instead of upstream DUSt3R's
+`hooks_idx=[0, 6, 9, 12]` (encoder, block 5, block 8, `dec_norm(block 11)`). Every PCC gate
+compared the port with that reference, so the earlier 0.997 PCCs were correct statements
+about the wrong network: against upstream `AsymmetricCroCo3DStereo` the old reference scored
+0.979 / 0.954 pts3d PCC (apple / kitchen) with 27-83 % relative error, and its two pointmaps
+landed as two disjoint sheets. With the upstream taps the reference matches upstream to
+1e-6 and the port tracks it (rows above). **Every CO3Dv2 / ETH3D number further down this
+README (AUC@30, 12-pair PCC, `kicker`) was measured on the old network and is kept as
+history only — CO3D / ETH3D data are not on the validation host, so they were not
+re-measured.** Details in [Point-map quality fix](#point-map-quality-fix-2026-09-14) and
+`DEVICE_VALIDATION.md` "Point-map quality fix (2026-09-14)".
 
-## Demo — one CO3Dv2 pair
+## Demo — two views, one 3D point map
 
-Single pair from CO3Dv2 `apple` scene `540_79043_153212`, frames (0, 40).
-Both views preprocessed to 512×512 (pad-to-square + resize), fed
-through the ttnn port, pose recovered via PairViewer, point cloud
-rendered from the union of both predicted pointmaps.
+Two views of the VGGT `kitchen` example scene (frames 00 and 03, 779×520 each;
+gray-padded to 512×512 by the default preprocessing) go through the **served**
+model (`POST /predict`, `output_format: npz`, fused path on the p150a). The two
+predicted pointmaps — both in the camera-1 frame, DUSt3R convention — are
+plotted as one point cloud coloured by the source pixels (top 70 % confidence
+per view, padding pixels dropped), from two viewpoints:
 
-| source 1 | source 2 | predicted point cloud, two viewpoints |
+| view 1 (reference camera) | view 2 | fused 3D point map (served output, 2026-09-14) |
 |---|---|---|
-| ![source 1](media/source_1.png) | ![source 2](media/source_2.png) | ![point cloud](media/output.png) |
+| ![source 1](media/source_1.png) | ![source 2](media/source_2.png) | ![point map](media/pointmap.png) |
 
-### Pose recovery for this pair (port output vs CO3D GT)
+Measured on this pair (`DEVICE_VALIDATION.md` "Two-view point-map demo through the served
+path"): the two pointmaps land on one scene — median nearest-neighbour distance between
+the view-1 and view-2 clouds **0.0083** of the scene scale (torch fp32 reference on the same
+pair 0.0029; before the tap fix 0.39-0.65 = two sheets); PairViewer rotation between the
+views **43.29°** (torch 43.43°), estimated focals 442 / 436 px in the 512 grid (torch
+455 / 450); 122k points plotted per view; served `timing_ms.forward` 89.5 ms, whole request
+with the symmetric forward + PnP 534.9 ms.
 
-GT relative-rotation magnitude: **63.71°** (mid-baseline). DUSt3R-estimated
-focal is 335 px, CO3D GT focal is 456 px — the focal-estimation head
-under-estimates on this pair (the pad-to-square gray bars inflate the
-apparent depth).
-
-| variant | rot err | tr-dir err |
-|---|---:|---:|
-| DUSt3R-estimated focal | 14.61° | 27.00° |
-| known focal (CO3D GT K) | **9.51°** | **14.36°** |
-
-**Be honest about the numbers.** A 9.5° rotation error on a 64° baseline
-is a ~15 % relative error — useful for rough scene reconstruction, not
-precise pose. The error ceiling comes from three stacked limitations,
-*none of which are port bugs*:
-
-1. **Pad-to-square preprocessing.** CO3D apple is 2000×900 landscape;
-   pad-to-square puts the object inside a 512² canvas with 55 % gray
-   bars. DUSt3R wasn't trained on this distribution, so its focal-
-   estimation head reliably under-estimates. The port is fixed at
-   512×512 (the on-device DPT and RoPE caches assume 32×32 tokens);
-   the proper DUSt3R preprocessing (aspect-preserving crop to
-   multiple-of-16 per-view) would require re-sizing these caches.
-2. **Single-pair PairViewer.** The paper's full pipeline is the
-   N-view `PointCloudOptimizer` — an Adam loop that pulls overlapping
-   pointmaps across a scene into one consistent camera set. Single-pair
-   recovery can't disambiguate focal × rotation scale, so the residual
-   rot / tr error bakes in.
-3. **Minimal in-tree reference.** Our `reference.torch_dust3r.DUSt3R`
-   is the encoder + decoder + DPT forward only — no aspect-preserving
-   loader, no matcher, no global aligner. On CO3Dv2 `apple` it tops out
-   at `AUC@30 = 35.0` (paper reports 80+), and the port lives inside
-   that envelope (`AUC@30 = 38.1` est-focal, `40.4` known-focal over 12
-   pairs — port slightly *beats* the minimal ref).
-
-**The numbers the port-audit actually decides**: port-vs-reference PCC
-(head1_xyz ≥ 0.99, head2_xyz ≥ 0.99) and port-vs-reference pose Δ
-(+3.1 AUC@30). Those say the bf16 ttnn port faithfully reproduces the
-torch reference's outputs on real CO3D images. The *absolute* pose
-numbers are upstream — solving them needs the preprocessing + global
-alignment work in "future work" below.
-
-Regenerate this bundle with:
+Regenerate `media/pointmap.png` against a running server (default
+`http://127.0.0.1:20000`, e.g. `tt serve changh95/mast3r-p150`), or on the device
+directly with `--local` (needs `ttnn` + the weights):
 
 ```bash
-python3 make_demo.py
+python3 make_demo.py                                  # media/source_1.png + source_2.png -> server -> media/pointmap.png
+python3 make_demo.py a.png b.png --url http://host:20000 --out media/pointmap.png --pose
+python3 make_demo.py --local                          # ttnn in-process on /dev/tenstorrent/0
 ```
+
+It prints the per-view confidence stats, the two-cloud coherence number and (with
+`--pose`) the PairViewer rotation; `--save-response <prefix>` keeps the raw npz + JSON
+response and `--from-response <prefix>` re-renders from it. The previous demo
+(CO3Dv2 `apple` frames 0 / 40, `media/output.png` + `media/pose_accuracy.md`) was rendered
+by the old network and has been removed.
+
+### Point-map quality fix (2026-09-14)
+
+Root cause (found by running upstream `AsymmetricCroCo3DStereo` on the CPU from the same
+HF checkpoint): upstream `create_dpt_head` hooks `hooks_idx=[0, 6, 9, 12]` into the
+13-entry list `[enc, blk0, ..., blk11]` whose last entry is `dec_norm`'ed — i.e. the DPT
+heads see the encoder output, decoder **block 5**, **block 8** and **`dec_norm(block 11)`**.
+The port's torch reference (`Decoder.forward`, `tap_layers=(0, 6, 11)`) and the ttnn port
+(`full_decoder`) fed them blocks 0 / 6 / 11 un-normed.
+
+| pair (pad 512×512, torch fp32) | network | pts3d1 PCC / rel err vs upstream | pts3d2 PCC / rel err | two-cloud coherence | inlier 2 % | PairViewer rot |
+|---|---|---:|---:|---:|---:|---:|
+| apple | upstream DUSt3R | 1 | 1 | 0.0083 | 58.7 % | 64.30° (CO3D GT 63.71°) |
+| apple | old reference, taps 0/6/11 | 0.9789 / 0.266 | 0.9797 / 0.466 | **0.4165** | **0.0 %** | 58.50° |
+| apple | fixed reference, taps 5/8/norm(11) | **1.0000 / 0.0000** (max abs 1.8e-7) | 1.0000 / 0.0000 | 0.0083 | 58.7 % | 63.86° |
+| kitchen 00/03 | upstream DUSt3R | 1 | 1 | 0.0029 | 73.7 % | 43.43° |
+| kitchen 00/03 | old reference | 0.9541 / 0.375 | 0.9133 / 0.830 | **0.6127** | **0.0 %** | 35.05° |
+| kitchen 00/03 | fixed reference | 1.0000 / 0.0000 (7.2e-7) | 1.0000 / 0.0000 | 0.0029 | 73.7 % | 43.43° |
+
+The fix (`reference/torch_dust3r.py` `DPT_TAP_BLOCKS = (5, 8)`, `Decoder.forward` appends
+`dec_norm(f)` as the third tap and the DPT head crops `refinenet4` to layer 3's grid;
+`tt/ttnn_dust3r.py` `full_decoder` taps `DPT_TAP_BLOCKS` and always runs the two `dec_norm`
+`ttnn.layer_norm`s on device: +2 ttnn calls per pair, legacy graph 2397 / fused trace 946)
+and its device validation (legacy, fused, `MAST3R_ROPE=slices`, `MAST3R_PREPROC=crop` on
+four genuine pairs + one negative control) are in `DEVICE_VALIDATION.md` "Point-map quality
+fix (2026-09-14)"; the fixed port is within 0.07-0.32° of the torch PairViewer rotation on
+every pair and configuration, and the synthetic e2e gate improved from 0.9970 to 0.9987
+(fused, 73.11 ms) / 0.9968 to 0.9989 (legacy, 238.99 ms). The kitchen pairs sit at
+0.9875-0.9907 pts3d PCC (12-15 % relative error) — the same fidelity class the pre-fix port
+had on those pairs (bf16 on a 0.5-3 m depth range with thin structures), not a regression.
+
+**Preprocessing** (`MAST3R_PREPROC`, `postprocess.preprocess_image(img, size, mode)`) was
+re-examined in torch fp32 with the fixed taps, because gray-padding a landscape photo to a
+square was the first suspect: it was not the defect. `pad` (default; gray 128 to a square,
+bicubic 512×512) already gives one coherent scene on every genuine pair (coherence
+0.003-0.008, apple rotation 0.15° from the GT magnitude); upstream's `native` loader
+(long side 512, centre crop to a multiple of 16 → 512×384 / 336 / …) is only marginally
+tighter (0.002-0.007, focals ~3 % closer to CO3D's) and would need per-shape device graphs
+(positions, RoPE tables, DPT reshapes, trace shape) — not implemented, `MAST3R_PREPROC=native`
+raises with that explanation; `crop` (centre square crop) is worse (0.007-0.012, apple
+rotation 56.8°: it discards the periphery) but cheap and kept as a knob; edge-replication
+padding was mixed (better on apple, worse on kitchen) and not adopted.
+
+| pair | `pad` (default) coherence / rot | `native` (torch only) | `crop` | edge-pad (torch only) |
+|---|---:|---:|---:|---:|
+| apple | 0.0083 / 63.86° | 0.0074 / 63.66° | 0.0120 / 56.84° | 0.0039 / 64.29° |
+| kitchen 00/03 | 0.0029 / 43.43° | 0.0021 / 43.91° | 0.0091 / 46.35° | 0.0034 / 43.30° |
+| kitchen 00/08 | 0.0035 / 42.01° | 0.0022 / 42.17° | 0.0071 / 43.02° | 0.0046 / 44.68° |
+
+The RoPE-lever "2.57° → 3.76°" pose shift reported on 2026-09-13 was PnP on the old
+network's non-overlapping sheets; on the fixed port `llama` (default), `slices` and legacy
+RoPE give identical PCC to 4 decimals and 0.07-0.32° pose differences with no ordering, and
+`slices` costs 198-209 ms per pair vs 74 ms. `MAST3R_ROPE=llama` stays the default.
 
 ## Repository layout
 
@@ -103,12 +139,12 @@ tt-mast3r/
 ├── test_mast3r.py           # per-layer + end-to-end PCC & latency harness
 ├── eval_mast3r.py           # CO3Dv2 correctness + PairViewer pose eval
 ├── eval_eth3d.py            # ETH3D pose eval (eth3d_loader.py parses the COLMAP export)
-├── make_demo.py             # regenerates media/{source_1,source_2,output}.png
-├── media/                   # demo source images + rendered point cloud
+├── make_demo.py             # two-view point-map demo: served npz (or --local ttnn) -> media/pointmap.png
+├── media/                   # demo pair (kitchen 00/03: source_1/2.png) + rendered point map (pointmap.png)
 └── models/
     ├── demos/mast3r/
-    │   ├── reference/torch_dust3r.py    # pure-torch reference loader + forward
-    │   ├── postprocess.py               # image preprocess, pts3d/conf activation, PairViewer pose (torch/numpy only)
+    │   ├── reference/torch_dust3r.py    # pure-torch reference loader + forward (DPT_TAP_BLOCKS = upstream hooks)
+    │   ├── postprocess.py               # image preprocess (MAST3R_PREPROC pad|crop), pts3d/conf activation, PairViewer pose (torch/numpy only)
     │   └── tt/
     │       ├── ttnn_dust3r.py           # on-device ttnn port (legacy graph + fused path, TtDust3r trace wrapper)
     │       └── fused.py                 # TT_FUSED knobs (FusedConfig), RoPE permutation fold, cos/sin tables
@@ -151,23 +187,23 @@ from `HF_MODEL` (default `naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt`) at
 python3 test_mast3r.py --layer end_to_end --runs 25 --device-id 0
 ```
 
-Typical output on the latest commit (fused default, p150a, 2026-09-13):
+Typical output on the latest commit (fused default, fixed taps, p150a, 2026-09-14,
+`DEVICE_VALIDATION.md` gate table, log `s4_e2e_fused_after.log`):
 
 ```
 # port path: fused {'enabled': True, 'rope': 'llama', 'rope_lut': 'fp32', 'mm': 'dit', 'sdpa_chunks': (128, 256), 'trace': True, ...}
-# e2e head PCCs: head1=0.9791 head2=0.9966
+# e2e head PCCs: head1=0.9983 head2=0.9985
 --- layer: end_to_end
-pcc: 0.9970
-latency_ms: 72.96
-inference_speed: 13.7061
-accuracy: 99.7000
+pcc: 0.9987
+latency_ms: 73.11
 status: PASS
 ---
 ```
 
 `TT_FUSED=0 python3 test_mast3r.py --layer end_to_end --runs 25` runs the legacy
-graph on the same tree and day: pcc 0.9968 (head1 0.9804 / head2 0.9963),
-latency_ms 234.18.
+graph on the same tree and day: pcc 0.9989 (head1 0.9985 / head2 0.9987),
+latency_ms 238.99 (idle-CPU re-run 238.85). Before the tap fix (2026-09-13) the same
+commands gave 0.9970 / 72.96 ms (fused) and 0.9968 / 234.18 ms (legacy).
 
 The harness is the same TSV-driven experiment runner style as `tt-vggt`:
 each landing change of the legacy graph is a row in `results.tsv` tagged
@@ -194,14 +230,17 @@ What the fused path does (all measured on the p150a, `DEVICE_VALIDATION.md`):
 | DPT exact cleanups: TILE reshape of the 4 taps, `Conv2dConfig(activation=relu)` | `MAST3R_DPT_FUSE=1` | 18.3 → 16.6 ms; bit-identical |
 | `dit_minimal_matmul_addcmul_fused` for the 120 residual linears (proj / fc2 / cproj) | `MAST3R_FUSED_MM=dit` (`linear` = plain `ttnn.linear`; `minimal` = also `minimal_matmul` for qkv/fc1, slower and less accurate, knob only) | −5.0 ms; 7-pair xyz PCC mean up |
 | `SDPAProgramConfig` q/k chunks on all 72 SDPA calls | `MAST3R_SDPA_CHUNKS=128,256` (`default` = ttnn's 32/32) | −14.4 ms; e2e PCC 0.9974 |
+| input preprocessing (independent of `TT_FUSED`; read by `postprocess.preprocess_mode`) | `MAST3R_PREPROC=pad` (`crop` = centre square crop; `native` raises: the graph is fixed at 512×512) | see [Point-map quality fix](#point-map-quality-fix-2026-09-14): `crop` coherence 0.007-0.012 vs `pad` 0.003-0.008 |
 
 Combined: 234.2 → 73.0 ms best-of-25 (3.2×), e2e PCC 0.9970, served forward
-73.6 ms median. Every fused configuration is within 0.0025 xyz PCC of the legacy
-graph on the 7 real pairs (all means above legacy). The one open signal is the
-single-pair PairViewer pose on the demo pair, which moved 58.65° → 55.95°
-(torch reference 58.50°); PnP-RANSAC on one pair is sensitive to bf16-level
-pointmap changes, and the 12-pair CO3Dv2 xyz / pose-AUC gate has **not** been
-re-run on the fused path.
+73.6 ms median (2026-09-13, pre-fix taps). Every fused configuration is within 0.0025
+xyz PCC of the legacy graph on the 7 real pairs (all means above legacy). With the fixed
+taps (2026-09-14): 73.11 ms / e2e PCC 0.9987 fused vs 238.99 ms / 0.9989 legacy, and on
+the four real pairs fused, `MAST3R_ROPE=slices` and legacy agree to 4 PCC decimals with
+0.07-0.32° of PairViewer rotation between them (the earlier "58.65° → 55.95°" demo-pair
+shift was PnP on the old network's disjoint sheets). The 12-pair CO3Dv2 xyz / pose-AUC
+gate has **not** been re-run on the fused path or on the fixed network (data not on the
+validation host).
 
 Per-stage runs (eager, `MAST3R_TRACE=0`, to localise a failure; the legacy
 comparison is the same command with `TT_FUSED=0`):
@@ -226,11 +265,18 @@ validate rules, zero host↔device transfers inside the trace capture):
 TREE=/path/to/tt-metal
 env -u TT_FUSED PYTHONPATH=.:$TREE:$TREE/ttnn TT_METAL_HOME=$TREE \
   $TREE/python_env/bin/python -m pytest -q -p no:cacheprovider models/tests/test_fused_host.py
-# 32 passed
+# 32 passed (op counts 2397 legacy / 946 fused trace incl. the two dec_norm layer_norms)
 python3 models/tests/mock_graph_run.py          # op counts of the fused graph (honours TT_FUSED and the sub-knobs)
 ```
 
 ## Correctness on CO3Dv2
+
+> **Measured on the old network (DPT taps 0 / 6 / 11, before 2026-09-14).** The numbers
+> in this section and in *Cross-dataset sanity: ETH3D* compare that port with that
+> reference, on the legacy graph. They are kept as the record of the port-vs-reference
+> methodology; they are **not** accuracy numbers of the current port. `eval_mast3r.py` and
+> `eval_eth3d.py` run unchanged against the fixed reference (`load_image_for_dust3r`
+> default `pad`), so an owner with the CO3Dv2 / ETH3D data can re-measure.
 
 ```bash
 # ~190 MB of images + annotations per category
@@ -247,10 +293,9 @@ See `co3d_eval_results.md` for the full write-up.
 
 ### PCC — port vs reference, real CO3D images
 
-12 pairs × 3 scenes on `apple` single-sequence, 512×512 pad-to-square. The CO3Dv2
-numbers in this section and the next were measured on the legacy graph (today's
-`TT_FUSED=0`) and have not been re-run on the fused default; the fused path's
-accuracy evidence is the 7-real-pair A/B in `DEVICE_VALIDATION.md`.
+12 pairs × 3 scenes on `apple` single-sequence, 512×512 pad-to-square, legacy graph,
+old taps (see the note above); the current port's accuracy evidence is the 4-real-pair
+table in `DEVICE_VALIDATION.md` "Point-map quality fix".
 
 | Metric                       | mean   | min    |
 |------------------------------|-------:|-------:|
@@ -322,7 +367,9 @@ image upload and the final 4-channel output download cross the boundary.
 - **SDPA**: `ttnn.transformer.scaled_dot_product_attention`, v stays on
   device (q / k only need RoPE).
 - **DPT head**: `ttnn.conv2d` (3×3), `ttnn.conv_transpose2d` (ap0/ap1_up),
-  `ttnn.upsample` (bilinear), `ttnn.relu`, `ttnn.linear` for 1×1 convs.
+  `ttnn.upsample` (bilinear), `ttnn.relu`, `ttnn.linear` for 1×1 convs; fed the
+  encoder output, decoder blocks 5 / 8 and the on-device `dec_norm(block 11)`
+  (upstream hooks, since 2026-09-14).
   Fused path: prepared conv weights cached on device after the first call,
   relu folded into `Conv2dConfig(activation=relu)`, TILE reshape of the taps.
 - **Fused path**: the whole graph (about a thousand ttnn calls, incl. `conv_transpose2d`,
@@ -372,6 +419,7 @@ legacy baseline re-measured at 234.2 ms / 0.9968 on the same tree and day):
 | 25 | discard | `MAST3R_SDPA_CHUNKS=128,128` | 80.9 | 12.4 | 0.9969 | 1.6 ms slower and less accurate than 128,256 |
 | 26 | **keep** | `MAST3R_SDPA_CHUNKS=128,256` | 79.3 | 12.6 | 0.9974 | −14.4 ms |
 | 27 | **keep** | **dit + SDPA 128,256 (new default)** | **73.0** | **13.7** | **0.9970** | **3.2× vs 234.2 ms; served forward 73.6 ms median** |
+| 28 | **keep** | **DPT taps = upstream hooks** (blocks 5 / 8 + `dec_norm(11)` on device; correctness fix, 2026-09-14) | **73.1** | 13.7 | **0.9987** | reference now == upstream to 1e-6; two-cloud coherence 0.42-0.65 → 0.004-0.012; legacy 239.0 ms / 0.9989 |
 
 Attribution runs (not defaults): `MAST3R_ROPE_LUT=bf16` 93.2 ms / 0.9966 (head1
 0.9768) and `MAST3R_ROPE=legacy` (the `rotary_embedding` op) 96.8 ms / 0.9967 —
@@ -409,6 +457,8 @@ both below the fp32-angle `llama` default.
   intermediate tensors to L1 regressed wall time.
 
 ## Cross-dataset sanity: ETH3D `kicker`
+
+> Old network (taps 0 / 6 / 11), legacy graph — see the note under *Correctness on CO3Dv2*.
 
 To check whether CO3D's 2.22:1 aspect was the dominant absolute-pose
 penalty, we also ran on the ETH3D multi-view DSLR `kicker` scene (6211×4137,
@@ -454,10 +504,14 @@ actually *regresses*, and the fix for that is an N-view GlobalAligner
 ## Future work
 
 - **Aspect-preserving preprocessing + per-view token grids.** The port's
-  encoder RoPE cache and DPT layout are wired for 32×32 tokens (512
-  square). Making them dynamic per input H/W — matching DUSt3R's own
-  `load_images` pipeline — would eliminate the pad-to-square focal bias
-  that drags every pair's absolute pose accuracy down.
+  encoder RoPE cache, DPT layout and metal trace are wired for 32×32 tokens
+  (512 square). Making them dynamic per input H/W — matching DUSt3R's own
+  `load_images` pipeline — was measured in torch fp32 (2026-09-14) to be
+  only marginally tighter than gray padding (coherence 0.002-0.007 vs
+  0.003-0.008, focals ~3 % closer to CO3D's); low priority now that the
+  taps are fixed.
+- **Re-measure CO3Dv2 / ETH3D on the fixed network.** The AUC@30 / 12-pair
+  PCC / `kicker` tables in this README describe the old taps.
 - **N-view `GlobalAligner` / `PointCloudOptimizer`.** Implement the
   full Adam loop over multi-pair pointmaps so we can evaluate RRA/RTA
   /AUC the way the paper does. PairViewer is the 2-view edge case; for
