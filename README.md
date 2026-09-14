@@ -528,6 +528,23 @@ actually *regresses*, and the fix for that is an N-view GlobalAligner
 - **Sibling `tt-vggt` port** on the same hardware provided the
   CO3D-eval + `PairViewer` metric template.
 
+## Comparison with an RTX 5090 (same host, 2026-09-14)
+
+device forward, one 512×512 pair (both views), batch 1; ratio = p150a ms / GPU ms.
+
+| setting | ms | vs p150a |
+|---|---:|---|
+| p150a, bf16 fused trace (served `timing_ms.forward`) | 73.9 | — |
+| RTX 5090 fp32 strict | 103.4 | p150a 1.4× faster |
+| RTX 5090 bf16 autocast | 63.8 | GPU 1.2× |
+| RTX 5090 fp16 autocast | 56.6 | GPU 1.3× |
+| RTX 5090 fp16 weights resident (eager) | 39.5 | GPU 1.9× |
+| RTX 5090 bf16 weights + `torch.compile` | 21.1 | GPU 3.5× |
+
+The reference uses explicit softmax attention (no FlashAttention); the served `npz` request adds ~160 ms of host compression on both sides.
+
+Methodology: same host, this repo's torch reference (same weights and preprocessing as the served p150a path) run eagerly in PyTorch 2.11 cu128 (fp32 weights + `torch.autocast` unless stated; no TensorRT), batch 1, medians of 50 iterations after warm-up, H2D/D2H included; GPU fp32 output matches the CPU fp32 reference (PCC 1.0). p150a rows are the served bf16 fused path incl. upload/readback. p150a power was not measured, so no efficiency comparison is made. Full per-precision table, power and memory: [`GPU_COMPARISON.md`](GPU_COMPARISON.md).
+
 ## License
 
 Apache 2.0 on port code; upstream DUSt3R checkpoint is CC BY-NC-SA 4.0,
