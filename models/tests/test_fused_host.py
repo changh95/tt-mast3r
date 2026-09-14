@@ -405,7 +405,7 @@ def test_graph_legacy_when_knob_off():
     assert g["add"] == ROPE_APPS + RESIDUAL_LINEARS + 2 * 10
     assert g["conv2d"] == 2 * 21 and g["conv_transpose2d"] == 2 * 2 and s["conv_host_weight_calls"] == 46
     assert g["relu"] == 2 * 15 and g["to_layout"] == 2 * 18 + 1 and s["conv2d_with_fused_relu"] == 0
-    assert s["total_ttnn_calls"] == 2395
+    assert s["total_ttnn_calls"] == 2395 + 2                                    # +2: dec_norm on device (tap fix 2026-09-14)
 
 
 def _check_fused_trace_shape(d):
@@ -433,7 +433,8 @@ def _check_fused_trace_shape(d):
 def test_graph_default_is_traced_dit_sdpa():
     """Nothing set (the served default since 2026-09-13): the traced single-kernel-RoPE graph
     with the 120 residual linears as ``dit_minimal_matmul_addcmul_fused`` and the explicit
-    SDPA program config on all 72 calls -- 944 ttnn calls per pair."""
+    SDPA program config on all 72 calls -- 946 ttnn calls per pair (944 before the
+    2026-09-14 tap fix: the last DPT tap is now the dec_norm'ed block-11 output, +2 layer_norm)."""
     d = _run_graph()
     c = d["cfg"]
     assert c["mm"] == "dit" and c["sdpa_chunks"] == [128, 256]
@@ -442,7 +443,7 @@ def test_graph_default_is_traced_dit_sdpa():
     assert g["linear"] == PLAIN_LINEARS + OTHER_LINEARS and "gelu" not in g
     assert s["sdpa_with_program_config"] == SDPA_CALLS
     assert g["add"] == 2 * 10
-    assert s["total_ttnn_calls"] == 1064 - RESIDUAL_LINEARS
+    assert s["total_ttnn_calls"] == 1066 - RESIDUAL_LINEARS
     assert _run_graph(TT_FUSED="1")["graph"] == g                             # TT_FUSED=1 == unset
 
 
@@ -457,7 +458,7 @@ def test_graph_fused_plain_linear_default_sdpa():
     assert g["linear"] == RESIDUAL_LINEARS + PLAIN_LINEARS + OTHER_LINEARS and "dit_minimal_matmul_addcmul_fused" not in g
     assert s["sdpa_with_program_config"] == 0
     assert g["add"] == RESIDUAL_LINEARS + 2 * 10
-    assert s["total_ttnn_calls"] == 1064
+    assert s["total_ttnn_calls"] == 1066
 
 
 def test_graph_fused_all_sub_knobs():
@@ -472,7 +473,7 @@ def test_graph_fused_all_sub_knobs():
     assert g["minimal_matmul"] == PLAIN_LINEARS and g["gelu"] == ENC_BLOCKS + DEC_BLOCKS
     assert g["linear"] == OTHER_LINEARS and g["add"] == 2 * 10
     assert g["sdpa"] == SDPA_CALLS and s["sdpa_with_program_config"] == SDPA_CALLS
-    assert s["total_ttnn_calls"] == 1064 - RESIDUAL_LINEARS + (ENC_BLOCKS + DEC_BLOCKS)
+    assert s["total_ttnn_calls"] == 1066 - RESIDUAL_LINEARS + (ENC_BLOCKS + DEC_BLOCKS)
 
 
 def test_graph_fused_eager_dit():

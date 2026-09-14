@@ -14,7 +14,7 @@ Two execution paths share this module:
 * **Fused (default: ``TT_FUSED`` unset or ``1``, read ONCE by :func:`fused_config` at model
   build)** -- the same graph with the host-implementable "megakernel" levers of
   ``reports/megakernel/mast3r-p150.md`` (see :class:`models.demos.mast3r.tt.fused.FusedConfig`
-  for every sub-knob), 944 ttnn calls per pair in one metal trace, 73 ms best-of-25 on the
+  for every sub-knob), 946 ttnn calls per pair in one metal trace, 73 ms best-of-25 on the
   p150a (``DEVICE_VALIDATION.md`` "Results"):
 
   - 2-D RoPE as ONE kernel per q/k (``ttnn.experimental.rotary_embedding_llama`` prefill,
@@ -47,6 +47,7 @@ import torch
 import torch.nn.functional as F
 import ttnn
 
+from models.demos.mast3r.reference.torch_dust3r import DPT_TAP_BLOCKS
 from models.demos.mast3r.tt.fused import (
     FusedConfig,
     permute_kv_rows,
@@ -891,10 +892,14 @@ def full_decoder(
     """Dual-branch DUSt3R decoder on TT.
 
     feat1, feat2: (B, N, 1024) encoder outputs.  pos: (B, N, 2).
-    Returns (out1, out2) each (B, N, 768).
-
-    When ``compute_norm=False`` (the dust3r_forward path), the final dec_norm
-    + downloads are skipped — DPT only consumes tap-layer features.
+    Returns ``(out1, out2, dev_taps1, dev_taps2)``: ``out*`` are the dec_norm'ed final
+    features downloaded to torch (``None`` when ``compute_norm=False``, the dust3r_forward
+    path -- the DPT head only consumes the taps); ``dev_taps*`` are the three DEVICE tensors
+    the DPT head takes after the encoder tap, in upstream order: block 5, block 8 and the
+    dec_norm'ed block 11 (``torch_dust3r.DPT_TAP_BLOCKS``; upstream ``hooks_idx=[0, 6, 9, 12]``).
+    The dec_norm always runs on device (2 ``layer_norm`` per pair); until 2026-09-14 the port
+    tapped blocks 0 / 6 / 11 un-normed -- a different network (DEVICE_VALIDATION.md
+    "Point-map quality fix").
 
     ``cfg``: fused-path configuration (``None`` = process-wide ``fused_config()``).
     """
@@ -923,7 +928,7 @@ def full_decoder(
     # end so we pay one sync wave instead of three mid-loop syncs per branch.
     dev_taps1: list = []
     dev_taps2: list = []
-    tap_layers = (0, 6, 11)
+    tap_layers = DPT_TAP_BLOCKS          # (5, 8); the third tap is dec_norm(block 11) below
     for i in range(depth):
         nf1 = decoder_block_device_pre(tt_f1, tt_f2, pos, pos, full_decoder._w1[i], device, cfg=cfg)
         nf2 = decoder_block_device_pre(tt_f2, tt_f1, pos, pos, full_decoder._w2[i], device, cfg=cfg)
@@ -932,9 +937,13 @@ def full_decoder(
             dev_taps1.append(tt_f1)
             dev_taps2.append(tt_f2)
 
+    # dec_norm of the last block is BOTH the decoder output and the DPT head's last tap
+    # (upstream ``final_output[-1] = dec_norm(...)``, hooked by ``hooks_idx[-1]``).
+    tt_out1 = ttnn.layer_norm(tt_f1, weight=full_decoder._dnorm_g, bias=full_decoder._dnorm_b, epsilon=1e-6)
+    tt_out2 = ttnn.layer_norm(tt_f2, weight=full_decoder._dnorm_g, bias=full_decoder._dnorm_b, epsilon=1e-6)
+    dev_taps1.append(tt_out1)
+    dev_taps2.append(tt_out2)
     if compute_norm:
-        tt_out1 = ttnn.layer_norm(tt_f1, weight=full_decoder._dnorm_g, bias=full_decoder._dnorm_b, epsilon=1e-6)
-        tt_out2 = ttnn.layer_norm(tt_f2, weight=full_decoder._dnorm_g, bias=full_decoder._dnorm_b, epsilon=1e-6)
         out1 = ttnn.to_torch(tt_out1)
         out2 = ttnn.to_torch(tt_out2)
     else:

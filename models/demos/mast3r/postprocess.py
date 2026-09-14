@@ -4,7 +4,9 @@ These helpers used to live in the CO3D eval harness (``eval_mast3r.py``); they
 moved here so the serving app -- and the eval scripts -- import them from the
 package instead of from a script. Semantics are unchanged.
 
-* :func:`preprocess_image`     pad-to-square (gray 128) -> bicubic 512x512 -> [-1, 1]
+* :func:`preprocess_image`     square 512x512 -> [-1, 1]; ``mode="pad"`` (default) gray-pads (128) to a
+                               square, ``mode="crop"`` centre-crops to a square (knob ``MAST3R_PREPROC``,
+                               :func:`preprocess_mode`)
 * :func:`activate_pts3d`       DUSt3R ``depth_mode='exp'`` activation of the xyz channels
 * :func:`activate_conf`        ``conf_mode=('exp', 1, inf)`` -> ``1 + exp(c)``
 * :func:`pair_viewer_pose`     DUSt3R PairViewer 2-view pose (focal median vote + PnP-RANSAC)
@@ -14,8 +16,9 @@ importing this module never requires OpenCV.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import numpy as np
 import torch
@@ -24,41 +27,81 @@ from PIL import Image
 #: The only input geometry the port was validated for (32x32 tokens, B=1 pair).
 IMG_SIZE = 512
 PAD_GRAY = (128, 128, 128)
+#: ``MAST3R_PREPROC`` values. Both keep the port's fixed 512x512 / 32x32-token geometry.
+PREPROC_MODES = ("pad", "crop")
+DEFAULT_PREPROC = "pad"
 
 
 # ---------- image preprocessing for DUSt3R (512x512) ----------
 
-def preprocess_image(img: Image.Image, size: int = IMG_SIZE):
-    """Pad to square (gray 128) then resize to ``size x size``, normalise to
-    [-1, 1]. Preserves image content; PCC port-vs-ref stays > 0.99 xyz on real
-    CO3D apple pairs. Returns the ``(1, 3, size, size)`` float32 tensor plus a
-    preprocess record that lets callers project intrinsics into the padded grid
-    (and map results back to the original image).
+def preprocess_mode(env: Optional[Mapping[str, str]] = None) -> str:
+    """The configured preprocessing, ``$MAST3R_PREPROC`` (default ``pad``).
+
+    ``pad``  gray-pad (128) the image to a square, bicubic-resize to 512x512 -- the port's
+             validated preprocessing (CO3Dv2 / ETH3D evals, the card numbers).
+    ``crop`` centre-crop the image to a square (min side, no padding), resize to 512x512;
+             loses the periphery of a non-square image, no out-of-distribution gray bars.
+    ``native`` (upstream ``load_images(size=512)``: long side 512, centre crop to a
+             multiple-of-16 box, i.e. 512x384 / 512x336 / 512x288 / 512x256 / 512x160 ...)
+             is NOT available: the port's traced device graph, RoPE tables and DPT reshapes
+             are built for 512x512 and the 2026-09-14 point-map study found it unnecessary
+             for coherent point maps once the decoder taps were fixed (DEVICE_VALIDATION.md
+             "Point-map quality fix").
     """
+    env = os.environ if env is None else env
+    v = (env.get("MAST3R_PREPROC") or DEFAULT_PREPROC).strip().lower()
+    if v == "native":
+        raise ValueError("MAST3R_PREPROC=native is not supported by this port (fixed 512x512 traced "
+                         "graph); use pad (default) or crop -- see postprocess.preprocess_mode")
+    if v not in PREPROC_MODES:
+        raise ValueError(f"MAST3R_PREPROC must be one of {PREPROC_MODES}, got {v!r}")
+    return v
+
+
+def preprocess_image(img: Image.Image, size: int = IMG_SIZE, mode: str = DEFAULT_PREPROC):
+    """Square ``size x size`` network input in [-1, 1] plus a preprocess record.
+
+    ``mode="pad"`` (default): pad to a square (gray 128) then bicubic-resize -- preserves
+    the whole image; ``mode="crop"``: centre-crop to a square (min side) then resize -- no
+    padding, the periphery of a non-square image is lost. Returns the ``(1, 3, size, size)``
+    float32 tensor and a record ``{orig_W, orig_H, offx, offy, pad_side, out_size, mode}``:
+    original pixel ``(x, y)`` maps to canonical ``((x + offx) * scale, (y + offy) * scale)``
+    with ``scale = out_size / pad_side``; ``pad_side`` is the side of the square canvas
+    (``max(W, H)`` for pad, ``min(W, H)`` for crop) and the offsets are >= 0 for pad,
+    <= 0 for crop. :func:`intrinsics_to_canonical` applies the same map to ``K``.
+    """
+    if mode not in PREPROC_MODES:
+        raise ValueError(f"preprocess mode must be one of {PREPROC_MODES}, got {mode!r}")
     img = img.convert("RGB")
     W, H = img.size
-    s = max(W, H)
-    canvas = Image.new("RGB", (s, s), PAD_GRAY)
-    offx, offy = (s - W) // 2, (s - H) // 2
-    canvas.paste(img, (offx, offy))
+    if mode == "pad":
+        s = max(W, H)
+        canvas = Image.new("RGB", (s, s), PAD_GRAY)
+        offx, offy = (s - W) // 2, (s - H) // 2
+        canvas.paste(img, (offx, offy))
+    else:  # crop
+        s = min(W, H)
+        x0, y0 = (W - s) // 2, (H - s) // 2
+        canvas = img.crop((x0, y0, x0 + s, y0 + s))
+        offx, offy = -x0, -y0
     canvas = canvas.resize((size, size), Image.BICUBIC)
     arr = np.asarray(canvas, dtype=np.float32) / 255.0
     arr = (arr - 0.5) / 0.5
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
     return tensor, {"orig_W": W, "orig_H": H, "offx": offx, "offy": offy,
-                    "pad_side": s, "out_size": size}
+                    "pad_side": s, "out_size": size, "mode": mode}
 
 
-def load_image_for_dust3r(path, size: int = IMG_SIZE):
+def load_image_for_dust3r(path, size: int = IMG_SIZE, mode: str = DEFAULT_PREPROC):
     """File-path convenience wrapper around :func:`preprocess_image` (eval scripts)."""
     with Image.open(Path(path)) as im:
-        return preprocess_image(im, size)
+        return preprocess_image(im, size, mode)
 
 
 def intrinsics_to_canonical(K: np.ndarray, preproc: dict) -> np.ndarray:
-    """Project a pinhole ``K`` given in ORIGINAL image pixels into the padded,
-    resized ``out_size x out_size`` grid the network saw (same arithmetic as the
-    CO3D/ETH3D GT-K projection in the eval scripts).
+    """Project a pinhole ``K`` given in ORIGINAL image pixels into the padded (or cropped),
+    resized ``out_size x out_size`` grid the network saw (same arithmetic as the CO3D/ETH3D
+    GT-K projection in the eval scripts; the record's offsets are negative for ``crop``).
     """
     K = np.asarray(K, dtype=np.float64).reshape(3, 3)
     scale = preproc["out_size"] / preproc["pad_side"]

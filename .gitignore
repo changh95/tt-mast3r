@@ -9,3 +9,4 @@ eval_bf16.log
 co3d_data/
 .omc/
 .DS_Store
+generated/

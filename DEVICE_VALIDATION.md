@@ -386,3 +386,242 @@ carries the fused and legacy numbers.
   image still carries the legacy default until the owner re-packages from this branch.
 - `minimal_matmul` (dropped) was measured only at the default 8/4/4 blocking; other block
   configs were not explored.
+
+## Point-map quality fix (2026-09-14)
+
+Owner report: "MASt3R seems to produce bad results based on visualization inspection" -- the
+demo `media/output.png` showed the two predicted pointmaps as two separate sheets instead of
+one scene. Evidence for everything below: `/home/deepgadget/experiments/tt-models/logs/pointmap/mast3r/`
+(scripts `pm_common.py`, `step0_upstream_vs_ref.py`, `step2_preproc_study.py`, `device_pairs.py`,
+`analyze_pairs.py`, `served_client.py`; chains `s1_before_chain.sh`, `s4_after_chain.sh`,
+`s4b_fern_chain.sh`, `s5_served_check.sh`; renders `before_*_pad.png`, `after_*_pad.png`,
+`after_*_crop.png`, `step2_fixed_*.png`; tables `*_metrics.md/json`; raw device outputs `dev_*.pt`).
+Host python_env of the gbp-tt tree, one p150a, nothing left running (tt-smi OK after every step).
+
+Metrics used throughout (host, on the ACTIVATED pointmaps): per-head PCC and relative error
+`||a-b||/||b||` vs the torch fp32 reference on the same preprocessed inputs; **overlap** =
+median nearest-neighbour distance of the conf-filtered (top 50 %) view-2 cloud into the
+view-1 cloud and vice versa, divided by the robust bbox diagonal of the view-1 cloud
+(`sym_med`; both clouds are in the camera-1 frame, so one scene gives a few 1e-3, two sheets
+give ~0.5), plus the fraction of view-2 points within 2 % of the scale (`inlier 2%`);
+PairViewer pose (est. focal, `conf_pct` 50) as rotation magnitude and rotation difference to
+the reference pose. Renders: union of both heads coloured by source pixels (two 3-D views,
+top-down) plus a top-down coloured by head, top 70 % confidence per view.
+
+### 1. Root cause: the decoder taps, not the padding
+
+Upstream DUSt3R (`dust3r/heads/dpt_head.py` `create_dpt_head`, dust3r tree on this box at
+`/home/deepgadget/monst3r/MASt3R-SLAM/thirdparty/mast3r/dust3r`) hooks `hooks_idx=[0, 6, 9, 12]`
+into the 13-entry list `_decoder` builds -- `[enc, blk0, ..., blk11]` with `dec_norm` applied to
+the last entry -- i.e. the DPT heads see the encoder output, decoder **block 5**, **block 8**
+and **dec_norm(block 11)**. The port's torch reference (`Decoder.forward`, `tap_layers=(0, 6, 11)`)
+and the ttnn port (`full_decoder`, `tap_layers = (0, 6, 11)`, `compute_norm=False`) fed them
+blocks 0 / 6 / 11 **un-normed**. Every PCC gate compared the port with that reference, so the
+1.0000 decoder / DPT PCCs and the 0.997 end-to-end PCC were correct statements about the wrong
+network. Upstream `AsymmetricCroCo3DStereo` run on the CPU from the same HF snapshot
+(`step0_upstream_vs_ref.py`, gray-pad 512x512 inputs, activated outputs):
+
+| pair (pad 512x512) | network | pts3d1 PCC / rel err | pts3d2 PCC / rel err | conf PCC 1 / 2 | overlap sym_med | inlier 2% | PairViewer rot | rot vs upstream |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| apple | upstream DUSt3R | 1 | 1 | 1 | 0.0083 | 0.587 | 64.30 deg (CO3D GT 63.71) | - |
+| apple | port reference, taps 0/6/11 (before) | 0.97888 / 0.266 | 0.97965 / 0.466 | 0.843 / 0.530 | **0.4165** | **0.000** | 58.50 | **17.10 deg** |
+| apple | port reference, taps 5/8/norm(11) (fixed) | **1.00000 / 0.0000** (max abs 1.8e-7) | 1.00000 / 0.0000 | 1.0000 / 1.0000 | 0.0083 | 0.587 | 63.86 | 0.59 |
+| kitchen 00/03 | upstream DUSt3R | 1 | 1 | 1 | 0.0029 | 0.737 | 43.43 | - |
+| kitchen 00/03 | port reference, taps 0/6/11 (before) | 0.95409 / 0.375 | 0.91328 / 0.830 | 0.836 / 0.703 | **0.6127** | **0.000** | 35.05 | **22.21 deg** |
+| kitchen 00/03 | port reference, taps 5/8/norm(11) (fixed) | 1.00000 / 0.0000 (7.2e-7) | 1.00000 / 0.0000 | 1.0000 / 1.0000 | 0.0029 | 0.737 | 43.43 | 0.00 |
+
+So the old reference was a different network (0.95-0.98 PCC, 27-83 % pointmap error, two
+disjoint sheets, 17-22 deg of pose error), and with the upstream taps it **is** upstream to
+fp32 round-off -- with the gray-padded square input. The gray padding was not the defect.
+
+### 2. Reproduction on the device (before the fix, HEAD 3a47b3d, pad 512x512)
+
+`s1_before_chain.sh` (legacy `TT_FUSED=0`, then fused default) on the apple, kitchen 00/03,
+kitchen 00/08 and the depth-anything-3 `source_1/2` pair; `analyze_pairs.py --taps current`
+against the OLD reference (`before_pad_metrics.md`, renders `before_{apple,kitchen,kitchen08,kitti}_pad.png`):
+
+| pair | config | pts3d1 / pts3d2 PCC vs old ref | overlap sym_med (old ref) | inlier 2% | PairViewer rot | rot vs old ref |
+|---|---|---:|---:|---:|---:|---:|
+| apple | legacy | 0.9991 / 0.9990 | 0.390 (0.417) | 0.000 | 58.65 | 2.57 |
+| apple | fused | 0.9992 / 0.9988 | 0.416 (0.417) | 0.000 | 55.95 | 3.76 |
+| kitchen | legacy | 0.9884 / 0.9958 | 0.572 (0.613) | 0.000 | 47.44 | 13.71 |
+| kitchen | fused | 0.9884 / 0.9956 | 0.545 (0.613) | 0.000 | 31.42 | 11.40 |
+| kitchen08 | legacy | 0.9882 / 0.9921 | 0.633 (0.650) | 0.000 | 39.82 | 15.32 |
+| kitchen08 | fused | 0.9884 / 0.9921 | 0.646 (0.650) | 0.000 | 33.82 | 25.78 |
+
+The device reproduced the reference faithfully (0.99 PCC) -- and the reference's two sheets
+(`before_apple_pad.png`: red view-1 cloud and blue view-2 cloud do not overlap in any row).
+The `source_1/source_2` "KITTI pair" of depth-anything-3 turned out to be two **different
+streets** (`source_3` is a third one): DUSt3R gives it head-2 confidence ~1.0 and no coherent
+overlap in every configuration, which is the right answer. It is kept in the tables as a
+negative control and replaced by LLFF `fern` 000/002 as the third genuine pair.
+
+### 3. Preprocessing study (torch fp32, fixed taps, `step2_preproc_study.py`, `step2_fixed_*.png`)
+
+(i) `pad` = the port's gray-pad square 512x512, (ii) `native` = upstream `load_images(size=512)`
+(long side 512, centre crop to a multiple of 16; the padded CO3D demo pair is un-padded first),
+(iii) `crop` = centre square crop -> 512x512, (iv) `edgepad` = edge-replication padding instead
+of gray. The reference DPT head needed upstream's `refinenet4(...)[:, :, :H3, :W3]` crop for the
+odd 32x21 token grid of 512x336 (added; a no-op at 32x32).
+
+| pair | preprocessing | input | overlap sym_med | inlier 2% | PairViewer rot | focals |
+|---|---|---|---:|---:|---:|---:|
+| apple | pad | 512x512 | 0.0083 | 0.587 | 63.86 (GT 63.71) | 494 / 477 (GT 456) |
+| apple | native | 512x224 | 0.0074 | 0.545 | 63.66 | 481 / 474 |
+| apple | crop | 512x512 | 0.0120 | 0.655 | 56.84 | 777 / 751 (cropped grid) |
+| apple | edgepad | 512x512 | 0.0039 | 0.697 | 64.29 | 524 / 500 |
+| kitchen | pad | 512x512 | 0.0029 | 0.737 | 43.43 | 455 / 450 |
+| kitchen | native | 512x336 | 0.0021 | 0.756 | 43.91 | 447 / 443 |
+| kitchen | crop | 512x512 | 0.0091 | 0.645 | 46.35 | 687 / 675 |
+| kitchen | edgepad | 512x512 | 0.0034 | 0.677 | 43.30 | 461 / 473 |
+| kitchen08 | pad | 512x512 | 0.0035 | 0.749 | 42.01 | 464 / 458 |
+| kitchen08 | native | 512x336 | 0.0022 | 0.904 | 42.17 | 449 / 443 |
+| kitchen08 | crop | 512x512 | 0.0071 | 0.642 | 43.02 | 675 / 737 |
+| kitchen08 | edgepad | 512x512 | 0.0046 | 0.743 | 44.68 | 484 / 497 |
+| kitti (negative control) | pad / native / crop / edgepad | | 0.10 / 0.41 / 0.24 / 0.25 | 0.00-0.34 | 166 / 174 / 108 / 57 | head-2 conf mean 1.0-1.1 |
+
+Decision: with the taps fixed, gray padding already gives coherent single-scene pointmaps on
+every genuine pair (overlap 0.003-0.008, apple rotation 0.15 deg from the GT magnitude);
+`native` is only marginally tighter (0.002-0.007, focal ~3 % closer to CO3D's) and would need
+per-shape device graphs (positions, RoPE tables, DPT reshapes, trace shape, server warm-up) --
+**not implemented**, rejected by the knob with that explanation; `crop` is worse (0.007-0.012,
+7 deg off on apple: it discards the periphery) but harmless and cheap, kept as a knob;
+`edgepad` is mixed (better on apple, worse on kitchen; its fabricated border geometry gets
+real confidence) -- not adopted. **`MAST3R_PREPROC=pad` (default) | `crop`.**
+
+### 4. The fix (this branch)
+
+- `reference/torch_dust3r.py`: `DPT_TAP_BLOCKS = (5, 8)`; `Decoder.forward` returns the two
+  block taps plus the dec_norm'ed final output as the third tap (upstream hooks); DPT head crops
+  `refinenet4` to layer 3's grid (odd token grids; no-op at 32x32).
+- `tt/ttnn_dust3r.py`: `full_decoder` taps `DPT_TAP_BLOCKS`, always runs the two `dec_norm`
+  `ttnn.layer_norm`s on device and hands `dec_norm(block 11)` to the DPT head as the last tap
+  (`compute_norm` now only controls the host download). +2 ttnn calls per pair: legacy graph
+  2397, fused 946 in the trace; `test_fused_host.py` counts updated, **32 passed**.
+- `postprocess.py`: `preprocess_image(img, size, mode)` with `pad` | `crop`, record gains
+  `mode` (offsets <= 0 for crop, same `(x + offx) * scale` mapping, `intrinsics_to_canonical`
+  unchanged); `preprocess_mode()` reads `MAST3R_PREPROC` (`native` -> explicit ValueError).
+- `server/app.py`: `_Config.preproc`, used in `/predict`, echoed in `preprocess[].mode`,
+  `/info.input.preprocess(_mode)`, startup log. `tt-model.yaml`: `MAST3R_PREPROC: "pad"` in
+  `serve.env`, verify lines for the knob and `DPT_TAP_BLOCKS`, card rows re-measured (below).
+- `media/output.png` re-rendered from the fixed device output (fused default);
+  `media/pose_accuracy.md`, README, SERVING.md updated; the pre-fix CO3Dv2 12-pair / AUC@30 /
+  ETH3D numbers describe the old network and were removed from the card (CO3D / ETH3D data
+  are not on this host).
+
+### 5. Device validation of the fixed port (pad 512x512 unless stated; `after_*_metrics.md`)
+
+`s4_after_chain.sh` + `s4b_fern_chain.sh`: legacy (`TT_FUSED=0`), fused default, fused with
+`MAST3R_ROPE=slices`, fused on `crop`; harness gates. Reference = the fixed torch fp32 network.
+
+| pair | config | pts3d1 PCC / rel | pts3d2 PCC / rel | conf PCC 1 / 2 | overlap sym_med (torch) | inlier 2% (torch) | PairViewer rot (torch) | rot vs torch | focals (torch) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| apple | legacy | 0.9994 / 0.030 | 0.9996 / 0.027 | 0.996 / 0.994 | 0.0123 (0.0083) | 0.540 (0.587) | 63.92 (63.86) | 0.31 | 479/465 (494/477) |
+| apple | **fused (default)** | **0.9995 / 0.029** | **0.9996 / 0.026** | 0.996 / 0.995 | 0.0119 | 0.577 | **63.97** | **0.27** | 481/459 |
+| apple | fused, ROPE=slices | 0.9995 / 0.029 | 0.9996 / 0.026 | 0.996 / 0.995 | 0.0121 | 0.563 | 63.76 | 0.26 | 481/464 |
+| kitchen 00/03 | legacy | 0.9902 / 0.131 | 0.9906 / 0.120 | 0.992 / 0.995 | 0.0039 (0.0029) | 0.690 (0.737) | 43.47 (43.43) | 0.14 | 442/436 (455/450) |
+| kitchen 00/03 | **fused** | 0.9901 / 0.132 | 0.9907 / 0.120 | 0.992 / 0.994 | 0.0040 | 0.694 | 43.29 | 0.23 | 442/436 |
+| kitchen 00/03 | slices | 0.9903 / 0.131 | 0.9908 / 0.119 | 0.992 / 0.995 | 0.0040 | 0.686 | 43.59 | 0.19 | 442/436 |
+| kitchen 00/08 | legacy | 0.9878 / 0.147 | 0.9921 / 0.116 | | 0.0043 (0.0035) | 0.712 (0.749) | 41.84 (42.01) | 0.25 | 451/445 (464/458) |
+| kitchen 00/08 | **fused** | 0.9875 / 0.149 | 0.9920 / 0.117 | | 0.0043 | 0.707 | 41.95 | 0.07 | 450/444 |
+| kitchen 00/08 | slices | 0.9877 / 0.147 | 0.9920 / 0.117 | | 0.0044 | 0.708 | 41.92 | 0.14 | 452/445 |
+| fern 000/002 | legacy | 0.9977 / 0.058 | 0.9967 / 0.070 | | 0.0211 (0.0218) | 0.447 (0.422) | 5.71 (5.54) | 0.20 | 442/447 (453/465) |
+| fern 000/002 | **fused** | 0.9978 / 0.057 | 0.9968 / 0.069 | | 0.0210 | 0.449 | 5.38 | 0.22 | 440/450 |
+| fern 000/002 | slices | 0.9976 / 0.059 | 0.9968 / 0.069 | | 0.0203 | 0.460 | 5.29 | 0.32 | 440/448 |
+| kitti (negative control) | fused | 0.9975 / 0.070 | 0.9940 / 0.109 | | 0.112 (0.101) | 0.017 (0.001) | 165 (166) | 34 (PnP on noise) | |
+| apple, `MAST3R_PREPROC=crop` | fused | 0.9989 / 0.041 | 0.9991 / 0.038 | | 0.0115 (0.0120) | 0.611 (0.655) | 56.86 (56.84) | 0.23 | 743/716 (777/751) |
+| kitchen 00/03, crop | fused | 0.9899 / 0.132 | 0.9989 / 0.040 | | 0.0080 (0.0091) | 0.607 (0.645) | 45.75 (46.35) | 0.79 | |
+| kitchen 00/08, crop | fused | 0.9896 / 0.134 | 0.9958 / 0.080 | | 0.0075 (0.0071) | 0.616 (0.642) | 42.66 (43.02) | 0.51 | |
+| fern, crop | fused | 0.9989 / 0.040 | 0.9981 / 0.053 | | 0.0258 (0.0280) | 0.352 (0.323) | 4.55 (4.74) | 0.26 | |
+
+Before -> after on the served default (fused, pad): apple overlap 0.416 -> 0.012 (torch
+0.417 -> 0.008), kitchen 0.545 -> 0.004 (0.613 -> 0.003), kitchen08 0.646 -> 0.004
+(0.650 -> 0.0035); inlier fraction 0 % -> 58 / 69 / 71 %; PairViewer rotation vs the (now
+correct) reference 3.8 / 11.4 / 25.8 deg -> 0.27 / 0.23 / 0.07 deg. Renders
+`after_{apple,kitchen,kitchen08,fern}_pad.png`: one scene in every row.
+
+Against the targets set for this fix: **pose within 1 deg of torch** -- 0.07-0.32 deg on all
+four genuine pairs, every configuration (met). **Overlap within 10 % of torch** -- met on fern
+(0.0210 vs 0.0218) and on every `crop` pair; on apple / kitchen / kitchen08 the device's
+`sym_med` is 0.004-0.012 against torch's 0.003-0.008, i.e. +25-45 % relative, while both are
+<= 1.2 % of the scene scale and the pre-fix values were 0.39-0.65: the metric is a median
+nearest-neighbour distance and bf16 point jitter sets its floor, so the relative gap is the
+port's noise floor, not a coherence difference; the `inlier 2%` fraction is within 2-6 % of
+torch on those pairs (not met as literally stated on three pairs; the absolute values say the
+clouds are one scene). **Per-head pts3d PCC >= 0.9970** -- met on apple (0.9995 / 0.9996) and
+fern (0.9978 / 0.9968 on head 2, 0.0002 short), not on the kitchen pairs (0.9875-0.9907;
+relative error 12-15 %): this is the same fidelity class the pre-fix port had on the same
+pairs (0.988 / 0.996, `before_pad_metrics.md`) and its 7-pair 2026-09-13 minimum (0.972), so
+the fix did not regress it; the kitchen scene's depth range (0.5-3 m of DUSt3R units, thin
+structures) is where bf16 shows. The gate the number 0.9970 came from is the synthetic
+end-to-end harness, which improved:
+
+| gate (fixed port, 2026-09-14) | result | log |
+|---|---|---|
+| `test_mast3r.py --layer end_to_end --runs 25`, fused default | PCC **0.9987** (head1 0.9983 / head2 0.9985), **73.11 ms** best-of-25 (before: 0.9970 / 72.9 ms) | `s4_e2e_fused_after.log` |
+| same, `TT_FUSED=0` | PCC 0.9989 (0.9985 / 0.9987), 238.99 ms; idle-CPU re-run 238.85 ms (before: 0.9968 / 236 ms) | `s4_e2e_legacy_after.log`, `s4b_e2e_legacy_idle.log` |
+| `test_mast3r.py --layer full_decoder --runs 5`, fused | PCC 1.0000 (b1 0.9999 / b2 1.0000), 20.93 ms | `s4_full_decoder_after.log` |
+| `pytest models/tests/test_fused_host.py` | 32 passed (op counts 2397 / 1066 incl. the two `dec_norm` layer_norms) | `s2_host_tests_fix.log` |
+| device forward, real pairs (`device_pairs.py`, median of 5) | fused 74.2-74.5 ms; `MAST3R_ROPE=slices` 198-209 ms; legacy 261 ms (idle) | `s4_*_after.log`, `s4b_*_fern.log` |
+
+**RoPE lever verdict**: on the real pairs the fused default (`llama` RoPE) is not measurably
+worse than `slices` (legacy numerics inside the fused graph, `torch.equal` to legacy) or legacy:
+identical PCC to 4 decimals, pose differences 0.07-0.32 deg for all three, no ordering. The
+pre-fix "2.57 -> 3.76 deg" pose shift attributed to the RoPE lever was PnP on the old network's
+non-overlapping sheets. **`MAST3R_ROPE=llama` stays the default**; `slices` costs 198-209 ms
+per pair vs 74 ms (2.7x) and buys nothing measurable.
+
+### 6. Not verified / left open
+
+- CO3Dv2 12-pair PCC / pose AUC@30 and the ETH3D `kicker` run: the data are not on this host;
+  the pre-fix numbers were dropped from the card, no replacement measured. `eval_mast3r.py` /
+  `eval_eth3d.py` run unchanged against the fixed reference (`load_image_for_dust3r` default
+  `pad`), so an owner with the data can re-measure.
+- Only the GT rotation *magnitude* of the demo pair is on this host (63.71 deg); 63.97 deg is a
+  magnitude comparison, not a rotation error.
+- `native` aspect (512x384-class) is not implemented (per-shape device graphs); measured in torch
+  only as marginally better than `pad`.
+- The package was not rebuilt (`tt-model package`) and nothing was pushed; the shipped image
+  `tt-model/mast3r-p150:2e8fe3cc610d` still carries the old taps until the owner re-packages.
+  The served-path check below ran that image with the fixed code bind-mounted.
+
+### 7. Served-path check (`s5_served_check.sh`, shipped image `2e8fe3cc610d`, fixed code bind-mounted, fused default)
+
+Boot: "Preprocessing: MAST3R_PREPROC=pad (gray-pad to square, bicubic 512x512)", "Metal trace
+captured", READY 6.9 s. `served_client.py` (apple pair, `return_pose: true`, npz decoded on the
+host): served pts3d1 / pts3d2 PCC vs the fixed torch reference **0.99948 / 0.99961**, conf
+0.9957 / 0.9945, overlap 0.0119 (torch 0.0083, inlier 57.7 % vs 58.7 %), PairViewer rotation
+**63.97 deg** (torch 63.86, 0.27 deg apart), focals 481 / 459 -- identical to the host-probe
+numbers of the same configuration, `preprocess[].mode = "pad"`, `/info.input.preprocess_mode =
+"pad"`; `timing_ms.forward` 81.8 (first request) / `forward_sym` 73.9 ms. `smoke_test.py
+--require-pose`: PASS, forward 73 ms, pose rot 64.0 deg f1 481 f2 459. `docker stop`: "Released
+954 cached device tensors", "Device closed", exit 0 in 1.0 s; `docker ps` empty, tt-smi OK.
+Logs `s5_served_check.log`, `s5_serve.log`, `s5_client.log`, `s5_smoke.log`, `s5_info.json`,
+`served_apple_resp.json`, `served_apple.npz`.
+
+## Two-view point-map demo through the served path (2026-09-14)
+
+The card demo was re-made from the SERVED model on the kitchen pair (VGGT `kitchen`
+frames 00 / 03, 779x520, now `media/source_1.png` / `source_2.png`; the CO3Dv2 apple pair
+moved to `logs/pointmap/mast3r/apple_source_{1,2}.png`). Server = the built image
+`tt-model/mast3r-p150:2e8fe3cc610d` launched with the `tt-model serve ... --print` flags plus
+the working-tree `code/models/{demos,server}` bind-mounted (the tap fix is not rebuilt into the
+image yet; `logs/pointmap/mast3r-p150/serve_current.sh`, boot log `serve.log`: fused, pad,
+"Metal trace captured", READY 8.0 s). `code/make_demo.py` (rewritten: server npz by default,
+`--local` for the in-process ttnn port) POSTed the pair with `return_pose`, saved the raw
+response (`served_kitchen_00_03.npz` + `_resp.json`) and rendered `media/pointmap.png`
+(`make_demo.log`):
+
+| quantity (served, fused default, pad) | value |
+|---|---:|
+| device forward / total request (`timing_ms`, with the symmetric forward + PnP) | 89.5 / 534.9 ms (first call 83.1 / 674.0) |
+| view-1 / view-2 confidence median within the photo | 12.45 / 14.80 (view 1 has 32 % of its pixels at conf < 1.5: the garden seen through the window) |
+| points plotted per view (top 70 %, conf >= 3, padding dropped) | 122k / 122k |
+| two-cloud coherence, median NN distance view-1 <-> view-2 / scene scale | **0.0083** (torch fp32 reference on the same pair: 0.0029, `after_pad_metrics.md`; before the tap fix 0.39-0.65) |
+| PairViewer rotation / focals (512 grid) | 43.29 deg / 442, 436 px (torch 43.43 deg / 455, 450) |
+
+`served_kitchen_00_03_by_head.png` (evidence, coloured by head) shows the red view-1 and blue
+view-2 clouds on one table plane in the top-down / front / side projections; `media/pointmap.png`
+was inspected: one coherent scene (bulldozer on the two mats, table plane), no second sheet.
+Container stopped with `docker stop` (SIGTERM): "Released 954 cached device tensors", "Device
+closed", `docker ps` empty, `tt-smi -s` OK.

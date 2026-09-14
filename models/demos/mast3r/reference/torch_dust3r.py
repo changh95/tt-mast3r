@@ -371,7 +371,9 @@ class DPTHead(nn.Module):
         l3 = self.layer3_rn(l3)
         l4 = self.layer4_rn(l4)
 
-        p4 = self.refinenet4(l4)
+        # upstream DPTOutputAdapter: crop refinenet4's 2x upsample to layer 3's grid (only
+        # differs for an odd token grid, e.g. 512x336 -> 32x21 tokens -> l4 is 16x11 -> 32x22).
+        p4 = self.refinenet4(l4)[:, :, :l3.shape[2], :l3.shape[3]]
         p3 = self.refinenet3(p4, l3)
         p2 = self.refinenet2(p3, l2)
         p1 = self.refinenet1(p2, l1)
@@ -476,6 +478,12 @@ def load_decoder_block(state: dict, idx: int, branch: int = 1) -> DecoderBlock:
     return blk.eval()
 
 
+#: Decoder blocks (0-based) whose outputs feed the DPT head, plus -- always -- the dec_norm'ed
+#: output of the last block: upstream ``hooks_idx=[0, 6, 9, 12]`` (encoder, block 5, block 8,
+#: norm(block 11)). Shared with the ttnn port (``ttnn_dust3r.full_decoder``).
+DPT_TAP_BLOCKS = (5, 8)
+
+
 class Decoder(nn.Module):
     """Dual-branch decoder: 12 blocks × 2 branches + final dec_norm."""
 
@@ -486,7 +494,20 @@ class Decoder(nn.Module):
         self.blocks2 = nn.ModuleList([DecoderBlock(dec_dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dec_dim, eps=1e-6)
 
-    def forward(self, feat1, feat2, pos, tap_layers=(0, 6, 11)):
+    def forward(self, feat1, feat2, pos, tap_layers=DPT_TAP_BLOCKS):
+        """Returns ``(dec_norm(f1), dec_norm(f2), taps1, taps2)``.
+
+        ``taps*`` are the three decoder features the DPT head consumes, in upstream
+        DUSt3R's order: the outputs of blocks ``tap_layers`` (0-based; default 5 and 8) and,
+        last, the ``dec_norm``'ed output of the final block. Upstream
+        (``dust3r/heads/dpt_head.py`` ``create_dpt_head``) hooks ``hooks_idx=[0, l2*2//4,
+        l2*3//4, l2] = [0, 6, 9, 12]`` into the 13-entry list ``[enc, blk0, ..., blk11]`` that
+        ``_decoder`` builds, whose last entry is dec-normed -- i.e. encoder output, block 5,
+        block 8, norm(block 11). Until 2026-09-14 this reference (and the ttnn port) tapped
+        blocks 0 / 6 / 11 un-normed, which is a different network: 0.979 PCC / 27-47 %
+        relative pointmap error vs upstream and two disjoint pointmap sheets per pair
+        (see DEVICE_VALIDATION.md "Point-map quality fix").
+        """
         f1 = self.embed(feat1)
         f2 = self.embed(feat2)
         taps1 = []
@@ -498,7 +519,10 @@ class Decoder(nn.Module):
             if i in tap_layers:
                 taps1.append(f1)
                 taps2.append(f2)
-        return self.norm(f1), self.norm(f2), taps1, taps2
+        n1, n2 = self.norm(f1), self.norm(f2)
+        taps1.append(n1)
+        taps2.append(n2)
+        return n1, n2, taps1, taps2
 
 
 class DUSt3R(nn.Module):
